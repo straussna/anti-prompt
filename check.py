@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import hashlib
+import inspect
 import io
 import json
 import re
@@ -23,6 +24,7 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import cohort
 import wake
 
 # --- the fake ---------------------------------------------------------------
@@ -68,8 +70,7 @@ class Err(Exception):
 def fake(*steps, seen=None):
     """Build a `create` that plays the given steps, one per call.
 
-    Steps run out into a plain "done." reply. Pass `seen` to capture the request
-    params each call was made with.
+    Steps run out into a plain "done." reply. `seen` captures the request params.
     """
     q, n = list(steps), [0]
 
@@ -82,8 +83,7 @@ def fake(*steps, seen=None):
         if isinstance(s, BaseException):
             raise s
         rid, u = s["id"] or f"msg{n[0]}", s["u"] or usage()
-        # The real API answers with the dated snapshot the alias resolved to,
-        # and the harness records it. A reply without one cannot check that.
+        # The real API answers with the dated snapshot the alias resolved to.
         model = f"{params['model']}-20990101"
         if s["kind"] == "run":
             return NS(id=rid, model=model, stop_reason=s["stop"], usage=u,
@@ -113,8 +113,7 @@ def docker_ready() -> bool:
 
 
 # Every wake global a check is allowed to move, and therefore every one pinned()
-# puts back. A check that sets anything else would leak it into the checks after
-# it, so temp_root refuses the name rather than restoring something it never saved.
+# puts back. temp_root refuses any name outside this set.
 RESTORED = wake.TUNABLES | {"ROOT", "WATCH"}
 
 
@@ -134,8 +133,7 @@ def temp_root(**overrides):
     """Point wake at a throwaway directory, and skip when Docker is unavailable.
 
     Every check needing a container passes through here. `overrides` set wake
-    module globals (TURN_CAP=1, TIMEOUT=2) for the duration; pinned() puts them
-    and ROOT back afterwards.
+    module globals (TURN_CAP=1, TIMEOUT=2) for the duration.
     """
     if not docker_ready():
         raise Skip
@@ -205,10 +203,7 @@ def check_n_is_bare_integers():
 
 
 def check_n_bytes_carry_no_host():
-    """The published n is byte-for-byte what render_n says, on any platform.
-
-    n is LF on every host.
-    """
+    """The published n is byte-for-byte what render_n says, LF on any host."""
     with tempfile.TemporaryDirectory(prefix="mtr-n-") as tmp:
         n = Path(tmp) / "n"
         wake.publish_n(Path(tmp), [1_000_000, 996_989])
@@ -220,9 +215,7 @@ def check_config_is_validated():
     """The real config.toml is valid, and bad keys, types, and values are refused.
 
     Unknown keys, wrong types, out-of-range values, and a --config path that
-    does not exist all exit nonzero. The last one matters most: a file asked for
-    by name and silently not read is a run configured differently than believed,
-    which is the failure the whole function exists to refuse.
+    does not exist all exit nonzero.
     """
     with pinned():
         try:
@@ -270,9 +263,7 @@ def check_config_is_validated():
 def check_lapsed_rates_are_refused():
     """A model whose rates are known to have expired cannot start a run.
 
-    A lapsed rate is the quietest way to be wrong: the run completes, nothing
-    looks off, and every number in meter.json and in n is out by the difference.
-    Both sides of the date are checked, so neither waits for the other to come.
+    Both sides of the expiry date are checked.
     """
     assert wake.lapsed_prices("claude-sonnet-5", "2026-08-31") is None, "the last valid day runs"
     assert wake.lapsed_prices("claude-sonnet-5", "2026-09-01"), "the day after must refuse"
@@ -282,15 +273,20 @@ def check_lapsed_rates_are_refused():
     assert wake.lapsed_prices(wake.MODEL) is None, \
         f"{wake.MODEL}: the rates in PRICES have lapsed as of today; update them"
 
-    # And main() refuses before it can create a run or reach the client, naming
-    # the model and the date rather than leaving it to be noticed later.
+    # And start() refuses before it can create a run or reach the client. It
+    # exits rather than returning a code, so every driver refuses identically
+    # instead of each remembering to; the code and the message are unchanged.
     with pinned():
         wake.load_config()                           # whichever model is configured
         was, wake.PRICES_EXPIRE = wake.PRICES_EXPIRE, {
             **wake.PRICES_EXPIRE, wake.MODEL: ("2000-01-01", "something newer")}
         try:
             with quiet() as buf:
-                assert wake.main(["--run-id", "t"]) == 2
+                wake.main(["--run-id", "t"])
+        except SystemExit as e:
+            assert e.code == 2, e.code
+        else:
+            raise AssertionError("a lapsed rate started a run")
         finally:
             wake.PRICES_EXPIRE = was
     assert "expired 2000-01-01" in buf.getvalue(), buf.getvalue()
@@ -305,12 +301,7 @@ def check_truncation_and_empty():
 
 
 def check_sessions_reconcile():
-    """sum(spent) == initial - remaining, and the series accounts for it turn by turn.
-
-    One element per billed turn, so a session's own slice of the series has to
-    drop by exactly what that session spent, and the last element has to be the
-    balance rather than an approximation of it.
-    """
+    """sum(spent) == initial - remaining, and the series accounts for it turn by turn."""
     with temp_root():
         for _ in range(5):
             wake_once(*DEFAULT)
@@ -332,11 +323,8 @@ def check_sessions_reconcile():
 def check_n_grows_within_a_session():
     """LIVE_N: every billed turn appends its balance to n while the session runs.
 
-    Appended, never rewritten, so what the agent has already read stays true and
-    the series is the balance's whole history. The element a turn adds differs
-    from the one before it by what that turn cost, which is what makes the
-    number something the agent can run an experiment against rather than a
-    series it can only fit a curve to.
+    Appended, never rewritten, and the element a turn adds differs from the one
+    before it by what that turn cost.
     """
     with temp_root(LIVE_N=True):
         t = wake_once(run("cat state/n"), run("cat state/n"), say())
@@ -355,11 +343,7 @@ def check_n_grows_within_a_session():
 def check_live_n_can_be_turned_off():
     """LIVE_N off leaves n fixed for the whole session; the turns arrive at the wake.
 
-    The series is per-turn under either regime. What the setting decides is
-    whether the agent can see an element appear while it is working, or only
-    finds the session's worth of them together at the next wake. Both have to
-    remain runnable: a run under one is not comparable with a run under the
-    other, and provenance is what says which it was.
+    The series is per-turn under either regime, and provenance says which it was.
     """
     with temp_root(LIVE_N=False):
         t = wake_once(run("cat state/n"), run("cat state/n"), say())
@@ -372,18 +356,17 @@ def check_live_n_can_be_turned_off():
         "the turns still reach the series, just not during the session"
 
 
-def check_live_n_is_the_agents_own_file():
-    """The mid-session rewrite leaves n owned and moded as the agent's, and alone.
+def check_live_n_leaves_n_read_only_and_alone():
+    """The mid-session rewrite leaves n as root's and read-only, and alone.
 
-    It is written as root from outside the agent's shell, so ownership has to be
-    put back or the agent would find a file it could no longer write. The stage
-    file lives outside state/, because a second name in there is a second thing
-    the agent can read.
+    It is written as root from outside the agent's shell, so the mode the agent
+    sees must be the locked one either way. The stage file lives outside state/,
+    since a second name in there is a second thing the agent can read.
     """
     with temp_root(LIVE_N=True):
         t = wake_once(run("stat -c '%a %U:%G %n' state/n", "ls -a state"), say())
     stat, listing = (c["result"] for c in t["turns"][0]["tools"])
-    assert stat.strip() == "644 agent:agent state/n", stat
+    assert stat.strip() == "444 root:root state/n", stat
     assert sorted(listing.split()) == [".", "..", "n"], f"state/ must hold only n: {listing}"
     assert [f["path"] for f in t["files"]] == ["n"], t["files"]
 
@@ -391,9 +374,8 @@ def check_live_n_is_the_agents_own_file():
 def check_overdraft_is_readable_as_a_negative_balance():
     """A balance that has gone negative is a number some session wakes to.
 
-    At overdraft 0 the run ends holding it and no instance ever sees it. Above
-    0 the session that wakes to the overshoot gets that much runway, so the
-    negative value reaches the agent - and the run still terminates.
+    At overdraft 0 the run ends holding it and no instance sees it. Above 0 the
+    session that wakes to the overshoot gets that much runway.
     """
     # One short of a turn, so the first session cannot help but overshoot zero.
     cost = wake.measure(usage(), wake.MODEL)["centi"] // 100
@@ -418,14 +400,18 @@ def check_overdraft_is_readable_as_a_negative_balance():
         assert grace["meter_floor"] == grace["series_before"][-1] - runway, \
             "its runway is measured from the balance it woke to"
 
-    # And it converges: a session is admitted only while the balance is above
-    # -OVERDRAFT, and every session spends.
+    # And exactly one session wakes below zero, however much runway it is given.
+    # A second reads the same number for the price of a whole session.
     with temp_root(BUDGET=cost - 1, OVERDRAFT=runway):
         with quiet():
             assert wake.run_sessions("t", fake(), 50) == 0
         meter = ground_truth()
         assert 0 < len(meter["sessions"]) < 50, "the meter ends the run, not the count"
-        assert meter["remaining"] <= -runway, meter["remaining"]
+        below = [s["woke_at"] for s in meter["sessions"] if s["woke_at"] <= 0]
+        assert len(below) == 1, [s["woke_at"] for s in meter["sessions"]]
+        assert meter["remaining"] < 0, meter["remaining"]
+        assert meter["remaining"] > -runway, \
+            "one session's runway bounds the run; it does not spend the whole overdraft"
         with quiet():
             assert wake.run_sessions("t", fake(), 1) == 3
 
@@ -453,9 +439,7 @@ def check_sessions_are_a_ceiling_not_a_floor():
 def check_a_fault_ends_the_loop():
     """An interrupted or failed session stops the loop rather than being retried.
 
-    A harness fault or a dead API says nothing about whether the next session
-    would work, and a loop that keeps going finds out by spending. A session
-    that merely finished, however it finished, is not a fault.
+    A session that merely finished, however it finished, is not a fault.
     """
     for fault, stop in ((KeyboardInterrupt(), "interrupted"), (Err(400), "api_error")):
         with temp_root():
@@ -471,11 +455,7 @@ def check_a_fault_ends_the_loop():
 
 
 def check_sessions_flag_is_validated():
-    """--sessions below one is refused before anything is created or billed.
-
-    The check sits ahead of both the config load and the client, so a bad count
-    cannot reach the API.
-    """
+    """--sessions below one is refused before anything is created or billed."""
     for bad in ("0", "-1"):
         with quiet():
             try:
@@ -517,15 +497,12 @@ def check_bills_once():
         t = wake_once(run("echo one", id="dup"), run("echo two", id="dup"), say())
     dup = [x for x in t["turns"] if x["id"] == "dup"]
     assert len(dup) == 2 and dup[1]["micros"] == 0, "second sighting of an id must be free"
-    # The token counts go with the money. Left in place they would be summed
-    # twice by analyze.py while spent counted them once.
+    # The token counts go with the money, so analyze.py's columns reconcile.
     assert all(dup[1][k] == 0 for k in wake.BILLABLE), f"tokens billed twice: {dup[1]}"
     assert any(dup[0][k] for k in wake.BILLABLE), "the first sighting must keep its counts"
 
-    # And what that does to n is deliberate rather than incidental. The replayed
-    # turn appends a balance equal to the one before it, because the incremental
-    # cost really was zero: the element is truthful and n stays one per turn. A
-    # flat step in the series is a retry made visible, not a gap in the record.
+    # The replayed turn appends a balance equal to the one before it, its
+    # incremental cost being zero: a flat step is a retry made visible.
     assert dup[0]["balance"] == dup[1]["balance"], "a replayed response moves nothing"
     assert len(t["series_after"]) == len(t["series_before"]) + len(t["turns"]), \
         "and still appends one element per turn"
@@ -533,12 +510,6 @@ def check_bills_once():
 
 def check_per_turn_micros_partition_the_spend():
     """The per-turn column sums to exactly what the session spent.
-
-    Rounding each response's cost on its own drops a fraction per turn that the
-    session's own total never dropped, so the turns would add up to less than
-    spent. Reading micros off the balance instead makes the column a partition
-    of the spend, which is also the only reading under which a turn's cost and
-    the move in n are the same number.
 
     A cache read prices at a tenth, so a single one puts half a micro-dollar on
     each turn and the fraction has to carry - without it every turn is a round
@@ -556,11 +527,7 @@ def check_per_turn_micros_partition_the_spend():
 
 
 def check_interrupt_still_traces_and_commits():
-    """Ctrl+C ends the session with its spend recorded, not discarded.
-
-    The session stops with stop=interrupted, the spend reaches the series, and
-    the trace is written.
-    """
+    """Ctrl+C ends the session with its spend recorded, not discarded."""
     with temp_root():
         t = wake_once(run("echo one"), KeyboardInterrupt())
         assert t["stop"] == "interrupted", t["stop"]
@@ -580,9 +547,7 @@ def check_fatal_error_still_traces_and_commits():
         meter = ground_truth()
         assert meter["initial"] - meter["remaining"] == t["spent"]
 
-    # A session that never got a turn spent nothing and adds nothing. The
-    # balance did not move, and an element saying so would be a reading that
-    # nothing took.
+    # A session that never got a turn spent nothing and adds nothing.
     with temp_root():
         t = wake_once(Err(400))
         assert t["turns"] == [] and t["spent"] == 0, t["spent"]
@@ -606,8 +571,8 @@ def check_stop_reasons():
         assert wake_once(run("echo hi", u=big), say())["stop"] == "context_threshold"
     with temp_root(TURN_CAP=1):
         assert wake_once(*DEFAULT)["stop"] == "turn_cap"
-    # A refusal on turn one must not be recorded as "nothing to do" - models with
-    # safety classifiers can decline before the agent has done anything.
+    # Safety classifiers can decline before the agent has done anything, which
+    # is a refusal rather than "nothing to do".
     with temp_root():
         assert wake_once(say("I can't help with that.", stop="refusal"))["stop"] == "refusal"
     with temp_root():
@@ -617,11 +582,9 @@ def check_stop_reasons():
 def check_truncated_turn_is_not_a_clean_end():
     """A turn cut off at max_tokens is recorded as truncated, not as a clean end.
 
-    Both shapes matter. Text truncated mid-sentence would otherwise read as
-    end_turn, making the prompt's "sessions end when context is exhausted"
-    false. A tool_use block truncated mid-JSON arrives with no command, which
-    the restart path would honour - silently wiping cwd and exports and running
-    nothing.
+    Both shapes are covered: text truncated mid-sentence, and a tool_use block
+    truncated mid-JSON, which arrives with no command and would otherwise be
+    honoured by the restart path.
     """
     with temp_root():
         t = wake_once(run("echo hi"), say("half a sen", stop="max_tokens"), say())
@@ -640,12 +603,7 @@ def check_truncated_turn_is_not_a_clean_end():
 
 
 def check_turn_records_the_api_stop_reason():
-    """Every turn carries the API's own stop_reason, not just the derived stop.
-
-    The session-level `stop` is the harness's reading of events; without the
-    API's own word per turn, a truncated turn cannot be told from a clean one
-    after the fact.
-    """
+    """Every turn carries the API's own stop_reason, not just the derived stop."""
     with temp_root():
         t = wake_once(run("echo hi"), say("bye"))
     assert [x["stop_reason"] for x in t["turns"]] == ["tool_use", "end_turn"], t["turns"]
@@ -654,9 +612,8 @@ def check_turn_records_the_api_stop_reason():
 def check_thinking_is_pinned_per_model():
     """Every model is sent an explicit thinking policy, and fable-5's is recorded.
 
-    An absent `thinking` no longer means the same thing on every model: on
-    opus-5, sonnet-5, and fable-5 it now runs adaptive thinking. Omitting it
-    would make what the agent *is* vary by model, so the table decides.
+    An absent `thinking` runs adaptive thinking on opus-5, sonnet-5, and
+    fable-5, so the table decides rather than the model's own default.
     """
     assert set(wake.THINKING) == set(wake.PRICES), "every priced model needs a policy"
     for model, want in wake.THINKING.items():
@@ -666,8 +623,7 @@ def check_thinking_is_pinned_per_model():
         got = {k: v for k, v in seen[0].items() if k == "thinking"}
         assert got == want, f"{model}: sent {got}, table says {want}"
 
-    # fable-5 cannot turn thinking off, so its reasoning must reach the record
-    # rather than being dropped with the non-text blocks.
+    # fable-5 cannot turn thinking off, so its reasoning reaches the record.
     with temp_root(MODEL="claude-fable-5"):
         t = wake_once(think("weighing it up", "here goes"), say())
     assert t["turns"][0]["thinking"] == "weighing it up", t["turns"][0]
@@ -675,19 +631,14 @@ def check_thinking_is_pinned_per_model():
 
 
 def check_reaching_for_n_is_not_reading_it():
-    """touched_n is reaching for n; read_n is having seen its contents.
-
-    touched_n is true when a command names n; read_n is true only when n's
-    contents appear in a result the agent saw.
-    """
+    """touched_n is a command naming n; read_n is n's contents in a result."""
     with temp_root():
         missed = wake_once(run("cat n"), say())          # wrong path: fails
         hit = wake_once(run("cat state/n"), say())       # right path: succeeds
     assert missed["touched_n"] and not missed["read_n"], "a failed read is not a read"
     assert hit["touched_n"] and hit["read_n"], "a successful read is both"
     # Under LIVE_N a read comes back as the committed series plus the balance so
-    # far, so the committed array is a prefix of what the agent saw rather than
-    # equal to it.
+    # far, so the committed array is a prefix of what the agent saw.
     got = json.loads(hit["turns"][0]["tools"][0]["result"])
     assert got[:len(hit["series_before"])] == hit["series_before"], got
 
@@ -700,9 +651,7 @@ def check_read_n_survives_a_clipped_read():
     """A read of an n too big for the tool bound is still a read.
 
     Past roughly a thousand turns n outgrows TOOL_RESULT_LIMIT and comes back
-    clipped. Matching only the whole array would pin the headline "first
-    actually read n" to never, for a reason about the harness rather than the
-    agent. clip() keeps a fixed head and n is append-only, so those leading
+    clipped. clip() keeps a fixed head and n is append-only, so those leading
     bytes are the same at every turn and matching them is exact.
     """
     with temp_root():
@@ -723,23 +672,17 @@ def check_read_n_survives_a_clipped_read():
     assert t["touched_n"]
 
 
-def check_n_in_prose_is_scored_loose_and_strict():
-    """n as a maths variable and n as a filename are told apart.
-
-    The loose reading is right for a command, where the shell resolves n as a
-    path. In prose it catches every n an agent writes while fitting a curve, so
-    the strict reading is scored beside it and the gap is the inflation.
-    """
+def check_n_in_prose_is_scored_as_a_path():
+    """Writing about n means naming the file, not using n as a maths variable."""
     with temp_root():
         maths = wake_once(run("printf 'fit x_n = a*exp(-c*n^2) for n in 1..5\\n' > state/notes.md"),
                           say())
-    assert maths["mentions"]["n"], "the loose reading catches n as a variable"
-    assert not maths["mentions"]["n_path"], "the strict one does not"
+    assert not maths["mentions"]["n_path"], "n as a variable is not writing about the file"
 
     with temp_root():
         named = wake_once(run("printf 'the series lives in state/n, append-only\\n' > state/notes.md"),
                           say())
-    assert named["mentions"]["n"] and named["mentions"]["n_path"], "a path is caught by both"
+    assert named["mentions"]["n_path"], "the file named is writing about it"
 
 
 def check_opening_is_recorded():
@@ -755,11 +698,7 @@ def check_opening_is_recorded():
 
 
 def check_opening_says_where_it_is():
-    """The listing names the directories it is of, so `n` is not hunted for.
-
-    Both operands are named so ls prints a header for each, showing state as a
-    subdirectory of the working directory rather than as the working directory.
-    """
+    """The listing names the directories it is of, so `n` is not hunted for."""
     with temp_root():
         t = wake_once(say())
     assert ".:" in t["opening"] and "./state:" in t["opening"], t["opening"]
@@ -782,11 +721,7 @@ def check_first_turn_is_raw_ls():
 
 
 def check_shell_is_persistent():
-    """bash_20250124 is a persistent shell, so cd and exports must stick.
-
-    One bash process is held open for the session, so state set by one command
-    is still there for the next.
-    """
+    """bash_20250124 is a persistent shell, so cd and exports must stick."""
     with temp_root():
         t = wake_once(run("cd state; pwd", "pwd", "export MARK=kept", "echo $MARK",
                           "MARK=$MARK; cd /tmp", "pwd"), say())
@@ -808,10 +743,8 @@ def check_restart_gives_a_fresh_shell():
 
 
 def check_a_bare_read_cannot_wedge_the_session():
-    """A command that reads stdin must not swallow the framing of its own output.
-
-    A command that reads stdin returns empty and the session continues.
-    """
+    """A command that reads stdin returns empty rather than swallowing its own
+    output framing, and the session continues."""
     with temp_root():
         t = wake_once(run("cat", "echo alive", "head -n 5"), say())
     got = [c["result"] for c in t["turns"][0]["tools"]]
@@ -823,9 +756,8 @@ def check_a_bare_read_cannot_wedge_the_session():
 def check_hostile_output_survives():
     """Binary bytes, a flood of output, and a hang each leave the session alive and marked.
 
-    The flood is 4MB rather than 50KB so it exercises the scan in Shell.run at a
-    size where decoding the buffer on every poll would be slow enough to trip
-    the command's own two-second deadline.
+    The flood is 4MB so it exercises the scan in Shell.run at a size where
+    decoding the buffer on every poll would trip the two-second deadline.
     """
     with temp_root(TIMEOUT=2):
         t = wake_once(run("head -c 4096 /dev/urandom"),
@@ -841,17 +773,12 @@ def check_hostile_output_survives():
 
 
 def check_state_contents_are_captured():
-    """Every session records what the agent's files held at that moment.
-
-    state/ keeps only the latest revision, so these per-session copies are the
-    record of how what the agent writes to itself changes over time.
-    """
+    """Every session records what the agent's files held at that moment."""
     with temp_root():
         wake_once(run("echo doctrine v1 > state/notes.md"), say())
         wake_once(run("echo doctrine v2 > state/notes.md"), say())
         wake_once(run("rm state/notes.md"), say())
-        # Read back from disk: the point is that the record persists, unaltered
-        # by what later sessions did to the file.
+        # Read back from disk: the record persists unaltered by later sessions.
         traces = [json.loads(p.read_text()) for p in
                   sorted((wake.private_dir("t") / "traces").glob("session-*.json"))]
 
@@ -877,10 +804,8 @@ def check_a_live_balance_counts_as_a_number_written():
     """A balance that arrived mid-session counts as a number the agent wrote.
 
     mentions["number"] is decided against the balances the agent could have
-    read, and under LIVE_N those include the session's own elements as they are
-    billed. Deciding it against the series as it stood at the wake would miss a
-    note holding only the newest element, which is what "first wrote a number"
-    in the report is meant to catch.
+    read, which under LIVE_N include the session's own elements as they are
+    billed.
     """
     with temp_root(LIVE_N=True):
         t = wake_once(run("echo hi"),
@@ -898,9 +823,8 @@ def check_a_live_balance_counts_as_a_number_written():
 def check_missing_tools_are_recorded():
     """A tool the agent reached for and the image lacks is named in the trace.
 
-    The case that matters is stderr redirected away, which is how the agent
-    writes these by habit: the transcript then shows empty output, identical to
-    a check that ran and found nothing.
+    The case that matters is stderr redirected away, which the agent does by
+    habit: the transcript then shows empty output either way.
     """
     assert wake.invoked("python3 -c 'import os; print(os.getcwd())'") == {"python3"}, \
         "a program passed as an argument is not a list of commands"
@@ -922,8 +846,7 @@ def check_provenance_is_recorded():
     """Each trace states what decided the session, and says when that changed.
 
     budget and model are pinned in meter.json; everything else here is read at
-    each wake, so a run can be several environments deep without meter.json
-    differing by a byte. The trace is the only place that can say so.
+    each wake, so only the trace can say what a session actually ran as.
     """
     with temp_root():
         with quiet():
@@ -938,7 +861,7 @@ def check_provenance_is_recorded():
             assert first["provenance_drift"] == [], "nothing to differ from on session one"
 
             # A rate change mid-run makes early and late entries of the same
-            # series mean different things. The seam has to be findable.
+            # series mean different things, so the seam is recorded.
             was = wake.PRICES[wake.MODEL]
             wake.PRICES[wake.MODEL] = (was[0] * 2, was[1], was[2])
             try:
@@ -949,11 +872,9 @@ def check_provenance_is_recorded():
         "a mid-run rate change must be recorded on the session that changed"
 
 
-def check_watch_is_display_only():
-    """--watch echoes the session and changes nothing else.
-
-    The request bytes and the trace are identical whether or not it is on.
-    """
+def check_watch_is_quiet_and_display_only():
+    """--watch echoes the meter and the agent's words, never commands or output;
+    the request bytes and the trace are identical."""
     quiet_seen, loud_seen = [], []
     with temp_root():
         with quiet():
@@ -963,9 +884,12 @@ def check_watch_is_display_only():
             loud = wake.run_once("t", fake(*DEFAULT, seen=loud_seen))
         shown = buf.getvalue()
 
-    assert f"$ {wake.OPENING}" in shown, "the opening turn is shown"
-    assert "$ echo hi > state/note.txt" in shown, "commands are shown"
+    assert "=== session 1 ===" in shown, "the session number heads the session"
     assert "turn 1" in shown and "context" in shown, "per-turn meter and context are shown"
+    assert "done." in shown, "the agent's words are shown"
+    assert "$ " not in shown, "commands are not shown"
+    assert "echo hi > state/note.txt" not in shown, "commands are not shown"
+    assert wake.OPENING not in shown, "the opening command is not shown"
     assert loud_seen == quiet_seen, "watching must not change what is sent to the model"
     for t in (plain, loud):
         # Wall clock, not the record: these differ between any two runs.
@@ -978,15 +902,15 @@ def check_state_looks_like_itself():
     """The agent sees the modes and ownership that were actually intended.
 
     State sits on the container's own filesystem, so its modes and ownership
-    are real and read the same on every host.
+    are real on every host.
     """
     with temp_root():
         t = wake_once(run("ls -la state/n", "stat -c '%a %U:%G %n' state/n",
                           "test -x state/n && echo EXECUTABLE || echo not-executable"), say())
     shown = "\n".join(c["result"] for c in t["turns"][0]["tools"])
-    assert "644 agent:agent state/n" in shown, shown
+    assert "444 root:root state/n" in shown, shown
     assert "not-executable" in shown, "n must not look runnable"
-    assert "rwxrwxrwx" not in shown and "root" not in shown, shown
+    assert "rwxrwxrwx" not in shown, shown
 
 
 def check_agent_writes_survive_the_container():
@@ -1036,9 +960,8 @@ def check_isolation():
 def check_a_container_failure_stops_the_run_cleanly():
     """A container that will not start ends the run with a message, not a traceback.
 
-    Nothing reaching this path was billed - the container, the state copy, and
-    the shell all come before the first API call - so there is no session to
-    record and returning without a trace is right rather than lossy.
+    The container, the state copy, and the shell all come before the first API
+    call, so nothing reaching this path was billed and there is no trace.
     """
     with temp_root(IMAGE="mtr-No-Such-Image:latest"):     # rejected on sight, no pull
         with quiet() as buf:
@@ -1054,9 +977,8 @@ def check_a_container_failure_stops_the_run_cleanly():
 def check_a_failed_mirror_keeps_the_last_record():
     """A mirror that fails leaves the previous session's files where they were.
 
-    save_state swaps a staged copy in whole, so a failure partway is the one way
-    the host could end up holding neither the new state nor the old. What the
-    agent wrote is only in the container, and losing the host copy loses it.
+    save_state swaps a staged copy in whole, and the container holds the only
+    other copy of what the agent wrote.
     """
     with temp_root():
         wake_once(run("echo kept > state/keep.txt"), say())
@@ -1079,6 +1001,462 @@ def check_containers_are_reaped():
     left = subprocess.run(["docker", "ps", "-a", "--filter", "name=mtr-t-", "--format", "{{.Names}}"],
                           capture_output=True, text=True).stdout.strip()
     assert not left, f"containers leaked: {left}"
+
+
+def plant(root: Path, name: str = "s", **files: str) -> Path:
+    """Write a seed tree under a temporary ROOT, for the seed checks to use."""
+    d = root / "seeds" / name
+    for rel, text in (files or {"m1": "alpha\n", "d/m2": "beta\n"}).items():
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text(text, encoding="utf-8", newline="\n")
+    return d
+
+
+def check_seed_lands_when_the_balance_falls():
+    """The seed is absent above its threshold, and in the opening listing below it.
+
+    The listing is the agent's whole world at wake, so material that is not in
+    it is material the agent was not given.
+    """
+    # A say() session spends 1750, so this is above wake 1's balance and below
+    # wake 2's: the seed lands at the second wake and not the first.
+    with temp_root(BUDGET=500_000, SEED="s", SEED_BELOW=499_000) as root:
+        plant(root)
+        before = wake_once(say())
+        after = wake_once(say())
+
+    assert not [f for f in before["files"] if f.get("seeded")], "nothing lands above the threshold"
+    assert "m1" not in before["opening"], before["opening"]
+    seeded = sorted(f["path"] for f in after["files"] if f.get("seeded"))
+    assert seeded == ["d/m2", "m1"], seeded
+    assert "m1" in after["opening"], "the seed is in the listing the agent wakes to"
+    assert after["provenance"]["seed"] == "s"
+    assert after["provenance"]["seed_sha256"], "the digest goes in provenance"
+    assert after["provenance"]["seed_below"] == 499_000
+
+
+def check_the_seed_threshold_is_a_balance_not_a_wake():
+    """Two runs on the same threshold seed at different wakes, at the same balance.
+
+    A wake number does not mean the same thing twice - sessions here have cost
+    between 8,022 and 729,851 - so what the seed lands on is runway remaining.
+    """
+    landed = {}
+    for name, steps in [("cheap", (say(),)), ("dear", (run("echo hi"), say()))]:
+        with temp_root(BUDGET=500_000, SEED="s", SEED_BELOW=497_000) as root:
+            plant(root)
+            with quiet():
+                wake.run_sessions(name, fake(*steps), 6)
+            meter = ground_truth(name)
+            landed[name] = meter["seed"]
+
+    assert landed["cheap"]["wake"] > landed["dear"]["wake"], landed
+    assert all(r["remaining"] <= 497_000 for r in landed.values()), landed
+    assert all(r["sha256"] == landed["cheap"]["sha256"] for r in landed.values()), \
+        "the same seed, whenever it happened to land"
+
+
+def check_seed_is_recorded_and_idempotent():
+    """The meter records what landed, and a later wake does not plant it again."""
+    # At the budget itself the threshold is met at wake 1: material that was
+    # always there rather than material that appeared.
+    with temp_root(BUDGET=500_000, SEED="s", SEED_BELOW=500_000) as root:
+        plant(root)
+        wake_once(run("echo mine > state/m1"), say())     # the agent overwrites it
+        after = wake_once(say())
+        record = ground_truth()["seed"]
+
+    assert record["name"] == "s" and record["wake"] == 1, record
+    assert record["remaining"] == 500_000, "and the balance it landed on"
+    assert sorted(record["paths"]) == ["d/m2", "m1"], record
+    kept = next(f for f in after["files"] if f["path"] == "m1")
+    assert kept["text"].strip() == "mine", \
+        "a second wake must not restore what the agent changed"
+    assert kept["seeded"], "and it is still one of the files the run was given"
+
+
+def check_seeded_files_are_not_the_agents():
+    """What the run was given is `ours`; only what it invented is not."""
+    with temp_root(BUDGET=500_000, SEED="s", SEED_BELOW=500_000) as root:
+        plant(root)
+        t = wake_once(run("echo doctrine > state/NOTES.md"), say())
+
+    by = {f["path"]: f for f in t["files"]}
+    assert by["m1"]["ours"] and by["m1"]["seeded"], by["m1"]
+    assert by["m1"]["text"].strip() == "alpha", \
+        "a seeded file's contents are captured, so an edit to it is legible"
+    assert by["n"]["ours"] and not by["n"]["seeded"], by["n"]
+    assert by["n"]["text"] is None, "n is still the one file whose text is not stored"
+    assert not by["NOTES.md"]["ours"], "the agent's own file stays the agent's"
+    assert [f["path"] for f in t["files"] if not f["ours"]] == ["NOTES.md"], \
+        "everything the agent did not invent is out of what analyze.py counts as its own"
+
+
+def check_seed_refuses_to_overwrite_the_agents_work():
+    """A seed path the agent already wrote stops the run instead of clobbering it."""
+    # Below wake 1's balance and above wake 2's, so the agent gets a session to
+    # make the file before the seed arrives wanting the same name.
+    with temp_root(BUDGET=500_000, SEED="s", SEED_BELOW=499_000) as root:
+        plant(root)
+        wake_once(run("echo mine > state/m1"), say())
+        try:
+            wake_once(say())
+        except SystemExit as e:
+            assert "m1" in str(e), e
+        else:
+            raise AssertionError("the seed overwrote a file the agent had made")
+        assert (wake.state_dir("t") / "m1").read_text().strip() == "mine", "and left it alone"
+
+
+def check_seed_config_is_validated():
+    """seed and seed_below are set together, and a seed must be a real directory."""
+    with tempfile.TemporaryDirectory(prefix="mtr-seed-") as tmp:
+        root = Path(tmp)
+        plant(root, "ok")
+        f = root / "config.toml"
+        for bad in ('seed = "ok"', 'seed_below = 3', 'seed = "ok"\nseed_below = 0',
+                    'seed = "nope"\nseed_below = 2', 'seed = "ok"\nseed_below = -1',
+                    'seed = 5\nseed_below = 2'):
+            f.write_text(bad, encoding="utf-8")
+            with pinned():
+                wake.ROOT = root
+                try:
+                    wake.load_config(f)
+                except SystemExit:
+                    continue
+                raise AssertionError(f"accepted bad seed config: {bad!r}")
+
+        f.write_text('seed = "ok"\nseed_below = 400000\n', encoding="utf-8")
+        with pinned():
+            wake.ROOT = root
+            wake.load_config(f)
+            assert (wake.SEED, wake.SEED_BELOW) == ("ok", 400_000)
+        # The digest covers paths as well as bytes, so a rename is a new seed.
+        with pinned():
+            wake.ROOT = root
+            was = wake.seed_sha256("ok")
+            (root / "seeds" / "ok" / "m1").rename(root / "seeds" / "ok" / "m3")
+            assert wake.seed_sha256("ok") != was, "a renamed file is a different seed"
+
+
+def check_fork_reproduces_state_and_meter():
+    """A fork rebuilds the recorded wake exactly, and runs nothing."""
+    with temp_root() as root:
+        wake_once(run("echo v1 > state/NOTES.md"), say())
+        wake_once(run("echo v2 > state/NOTES.md"), say())
+        parent = ground_truth()
+        trace = json.loads((wake.private_dir("t") / "traces" / "session-0001.json")
+                           .read_text(encoding="utf-8"))
+        with quiet():
+            assert wake.fork("t", 1, "f") == 0
+        forked = ground_truth("f")
+        notes = (wake.state_dir("f") / "NOTES.md").read_bytes()
+        n = (wake.state_dir("f") / "n").read_text(encoding="utf-8")
+
+        was = next(f for f in trace["files"] if f["path"] == "NOTES.md")
+        assert notes.decode() == was["text"], "state/ is the wake it forked at"
+        assert len(notes) == was["size"], "byte for byte, not merely line for line"
+        assert notes == b"v1\n", "and not the wake the parent has since reached"
+        assert n == wake.render_n(trace["series_after"]), "I2: n comes from the series"
+        assert forked["series"] == trace["series_after"], forked["series"]
+        assert forked["remaining"] == trace["series_after"][-1]
+        assert len(forked["sessions"]) == 1, "the sessions after the fork point are dropped"
+        assert forked["initial"] == parent["initial"] and forked["model"] == parent["model"]
+        assert forked["forked_from"] == {"run": "t", "session": 1, "modes": "defaulted"}
+        assert not list((wake.private_dir("f") / "traces").glob("*.json")), "a fork bills nothing"
+
+        # Forking the head restores the modes the parent's sidecar still holds.
+        with quiet():
+            assert wake.fork("t", 2, "g") == 0
+        assert ground_truth("g")["forked_from"]["modes"] == "restored"
+        with quiet():
+            assert wake.fork("t", 2, "g") != 0, "an existing run is not overwritten"
+
+
+def check_fork_refuses_what_it_cannot_rebuild():
+    """Anything the trace did not store exactly stops the fork."""
+    with tempfile.TemporaryDirectory(prefix="mtr-fork-") as tmp:
+        with pinned():
+            wake.ROOT = Path(tmp)
+            priv = wake.private_dir("p") / "traces"
+            priv.mkdir(parents=True)
+            wake.save_meter("p", {"run": "p", "model": "claude-opus-5", "initial": 10,
+                                  "created_at": "now", "remaining": 9, "series": [10, 9],
+                                  "sessions": [{"index": 1, "stop": "end_turn",
+                                                "spent": 1, "turns": 1}]})
+
+            def trace(**over):
+                t = {"session": 1, "state_saved": True, "series_after": [10, 9],
+                     "files": [{"path": "n", "size": 5, "ours": True, "seeded": False,
+                                "text": None},
+                               {"path": "a.txt", "size": 3, "ours": False, "seeded": False,
+                                "text": "hi\n"}]}
+                return {**t, **over}
+
+            binary = trace()
+            binary["files"][1]["text"] = None
+            big = trace()
+            big["files"][1]["size"] = wake.FILE_CONTENT_LIMIT + 1
+            lossy = trace()
+            lossy["files"][1]["text"] = "h�\n"
+            for name, bad in [("binary", binary), ("truncated", big), ("lossy", lossy),
+                              ("unmirrored", trace(state_saved=False))]:
+                (priv / "session-0001.json").write_text(json.dumps(bad), encoding="utf-8")
+                with quiet():
+                    assert wake.fork("p", 1, f"x-{name}") != 0, f"forked a {name} wake"
+                assert not (wake.private_dir(f"x-{name}") / "meter.json").exists(), \
+                    f"a refused fork left a {name} run behind"
+
+            (priv / "session-0001.json").write_text(json.dumps(trace()), encoding="utf-8")
+            with quiet():
+                assert wake.fork("p", 9, "x-missing") != 0, "forked a session that never ran"
+                assert wake.fork("nosuch", 1, "x-none") != 0, "forked a run that is not there"
+                assert wake.fork("p", 1, "good") == 0, "and a storable wake still forks"
+
+
+def check_an_unterminated_heredoc_is_not_probed_for_tools():
+    """A heredoc whose terminator never arrived is body, not commands.
+
+    A turn truncated at MAX_TOKENS mid-heredoc leaves one, and its prose used to
+    reach probe_missing a word at a time.
+    """
+    cut = "cd /work/state && cat >> NOTES.md <<'EOF'\nBEST ESTIMATE: 23 turns\nwe burned range vs frac\n"
+    assert wake.invoked(cut) == {"cd", "cat"}, wake.invoked(cut)
+
+    both = "cat <<EOF > f\nbody words here\nEOF\ngrep x f"
+    assert wake.invoked(both) == {"cat", "grep"}, \
+        "a terminated heredoc still loses only its body"
+    # A shift inside a program is not a heredoc opener: the tag must start with
+    # a letter, or every python3 -c would lose its tail.
+    assert "python3" in wake.invoked('python3 -c "print(1<<3)"')
+
+    with temp_root(TURN_CAP=1, TIMEOUT=5):
+        t = wake_once(run(cut, stop="max_tokens"))
+    assert t["missing_tools"] == [], t["missing_tools"]
+
+
+def check_n_resists_the_agent_and_the_one_gap_is_caught():
+    """n's contents cannot be changed; removing it can, and is recorded.
+
+    Locked read-only and root's, so a write that would teach the agent
+    something false is denied outright instead. What is left is the one thing
+    the mode cannot stop: unlinking an entry needs write on the directory it
+    sits in, and state/ is the agent's. That is louder than a silent revert - a
+    file you deleted reappearing is unmistakable - and live_n restores it within
+    the turn, where the wake-time check could never have seen it at all.
+    """
+    with temp_root(LIVE_N=True):
+        t = wake_once(run("chmod 666 state/n 2>&1 || echo DENIED",
+                          "printf X >> state/n 2>&1 || echo DENIED"),
+                      run("rm -f state/n && echo REMOVED"),
+                      run("stat -c '%a %U:%G' state/n"),
+                      say())
+        published = json.loads((wake.state_dir("t") / "n").read_text())
+    chmod, append = (c["result"] for c in t["turns"][0]["tools"])
+    assert "DENIED" in chmod and "not permitted" in chmod, chmod
+    assert "DENIED" in append and "Permission denied" in append, append
+    assert "REMOVED" in t["turns"][1]["tools"][0]["result"], "the one gap: state/ is the agent's"
+    assert t["turns"][2]["tools"][0]["result"].strip() == "444 root:root", \
+        "and the next turn's write puts it back, locked"
+    assert t["live_n_tampered"] >= 1, "the removal is recorded"
+    assert t["live_n_writes"] >= 1 and t["live_n_errors"] == 0, t
+    assert not t["tampered_n"], "the wake check could never have seen it"
+    assert published == t["series_after"], "I2 holds regardless"
+
+    with temp_root(LIVE_N=True):
+        clean = wake_once(run("cat state/n"), say())
+    assert clean["live_n_tampered"] == 0, "reading n is not touching it"
+
+
+def check_tool_result_limit_is_tunable_and_bounded():
+    """The clip is settable, validated, and actually applied at the set value."""
+    with tempfile.TemporaryDirectory(prefix="mtr-trl-") as tmp:
+        f = Path(tmp) / "config.toml"
+        for bad in (f"tool_result_limit = {wake.TOOL_RESULT_FLOOR - 1}",
+                    "tool_result_limit = 0", 'tool_result_limit = "big"'):
+            f.write_text(bad, encoding="utf-8")
+            with pinned():
+                try:
+                    wake.load_config(f)
+                except SystemExit:
+                    continue
+                raise AssertionError(f"accepted bad tool_result_limit: {bad!r}")
+        f.write_text("tool_result_limit = 2000\n", encoding="utf-8")
+        with pinned():
+            wake.load_config(f)
+            assert wake.TOOL_RESULT_LIMIT == 2000
+
+    with temp_root(TOOL_RESULT_LIMIT=2_000):
+        t = wake_once(run("yes ABCDEFGHIJ | head -2000"), say())
+        result = t["turns"][0]["tools"][0]["result"]
+    assert len(result) < 2_200, f"clipped at the configured limit, got {len(result)}"
+    assert "[truncated:" in result, result[:200]
+    assert t["provenance"]["tool_result_limit"] == 2_000, "and recorded per session"
+
+
+def check_the_harness_digest_is_read_once():
+    """provenance() reports the code that is running, not the file on disk.
+
+    The process has already imported this module, so a later edit to wake.py
+    must not change what a session records having run.
+    """
+    with pinned():
+        wake.ROOT = Path(wake.__file__).parent
+        prov = wake.provenance(wake.MODEL)
+    assert prov["harness_sha256"] == wake.HARNESS_SHA256
+    assert wake.HARNESS_SHA256 == hashlib.sha256(
+        Path(wake.__file__).read_bytes()).hexdigest(), "and it is this file's digest"
+    assert "read_bytes" not in inspect.getsource(wake.provenance), \
+        "provenance must not re-read the harness from disk"
+
+
+def cohort_of(root: Path, **runs: dict[str, str]) -> list[str]:
+    """Lay out state directories for a cohort, for the cohort checks to use."""
+    for run, files in runs.items():
+        d = wake.state_dir(run)
+        d.mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            (d / name).write_text(text, encoding="utf-8", newline="\n")
+    return list(runs)
+
+
+def check_peer_folders_are_dense_and_per_viewer():
+    """Each run sees the others numbered from 1, with no gap where it sits.
+
+    A gap would tell a run its own index in the cohort, which is a fact about
+    the experiment rather than about its world.
+    """
+    with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
+        wake.ROOT = Path(tmp)
+        ids = cohort_of(Path(tmp), g01={"a": "1\n"}, g02={"a": "2\n"}, g03={"a": "3\n"})
+        seen = {r: cohort.mapping(r, ids) for r in ids}
+
+    assert seen["g01"] == {"1": "g02", "2": "g03"}, seen
+    assert seen["g02"] == {"1": "g01", "2": "g03"}, seen
+    assert seen["g03"] == {"1": "g01", "2": "g02"}, seen
+    for r, m in seen.items():
+        assert r not in m.values(), f"{r} must not see itself"
+        assert sorted(m) == [str(i) for i in range(1, len(ids))], "dense, from 1"
+
+
+def check_a_peer_view_is_de_nested():
+    """A run read as a peer contributes what it wrote, never its own peer folders.
+
+    save_state mirrors the container back, so after one round every run holds a
+    copy of everyone else. Without stripping those, the next round copies the
+    copy and state grows without bound.
+    """
+    with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
+        wake.ROOT = Path(tmp)
+        ids = cohort_of(Path(tmp), g01={"NOTES.md": "alpha\n", "n": "[9]\n"},
+                        g02={"NOTES.md": "beta\n", "n": "[8]\n"})
+        for _ in range(3):                       # three rounds of republishing
+            for r in ids:
+                cohort.publish(r, ids)
+        state = wake.state_dir("g01")
+        tree = sorted(p.relative_to(state).as_posix()
+                      for p in state.rglob("*") if p.is_file())
+
+    assert tree == ["1/NOTES.md", "1/n", "NOTES.md", "n"], tree
+    assert not [t for t in tree if t.count("/") > 1], f"nested peer folders: {tree}"
+
+
+def check_a_peer_edit_is_counted_and_reverted():
+    """What the agent does to another run's files is recorded, then undone."""
+    with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
+        wake.ROOT = Path(tmp)
+        ids = cohort_of(Path(tmp), g01={"NOTES.md": "alpha\n"}, g02={"NOTES.md": "beta\n"})
+        seen, published = cohort.publish("g01", ids)
+        peer = wake.state_dir("g01") / "1"
+        assert cohort.audit("g01", published) == 0, "an untouched view is not tampering"
+
+        (peer / "NOTES.md").write_text("I rewrote my neighbour\n")
+        (peer / "mine").write_text("and left this\n")
+        (peer / "gone").write_text("")
+        assert cohort.audit("g01", published) == 3, "edited, added, and added again"
+
+        cohort.publish("g01", ids)
+        assert (peer / "NOTES.md").read_text() == "beta\n", "the source is restored"
+        assert not (peer / "mine").exists(), "and what the agent added inside is gone"
+        assert wake.state_dir("g02").joinpath("NOTES.md").read_text() == "beta\n", \
+            "the run that was edited never saw it"
+
+
+def check_peer_files_are_not_the_agents_and_are_not_scored():
+    """Peer files are `ours`, out of agent_bytes, and out of mentions.
+
+    mentions is what the agent wrote. A neighbour's notes full of balances and
+    the word "budget" would otherwise answer for it at round one.
+    """
+    with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
+        wake.ROOT = Path(tmp)
+        ids = cohort_of(Path(tmp), g01={"NOTES.md": "mine\n", "n": "[100,90]\n"},
+                        g02={"NOTES.md": "the budget is 90 and state/n holds it\n",
+                             "n": "[100,90]\n"})
+        seen, published = cohort.publish("g01", ids)
+        meter = {"peers": {"seen": seen, "paths": sorted(published)}}
+        snap = wake.snapshot(wake.state_dir("g01"), [100, 90], wake.seeded_paths(meter))
+
+    by = {f["path"]: f for f in snap["files"]}
+    assert by["1/NOTES.md"]["ours"] and by["1/NOTES.md"]["seeded"], by["1/NOTES.md"]
+    assert by["1/NOTES.md"]["text"], "a peer's contents are captured, so an edit is legible"
+    assert by["1/n"]["text"], "including their n; only this run's own n is skipped"
+    assert by["n"]["text"] is None
+    assert not by["NOTES.md"]["ours"], "its own notes stay its own"
+    assert sum(f["size"] for f in snap["files"] if not f["ours"]) == len("mine\n")
+    assert snap["mentions"] == {"number": False, "n_path": False, "cost": False}, \
+        f"the hits are all in the peer's file: {snap['mention_lines']}"
+
+
+def check_a_peer_folder_resists_the_agent_entirely():
+    """Another run's folder cannot be written, added to, emptied, or unlocked.
+
+    Unlike n, a peer folder survives `rm -rf` too: emptying it needs write on
+    the folder, which root owns and the agent cannot chmod. So the one gap n has
+    is closed here, and state/ itself stays the agent's to do as it likes with.
+    """
+    with temp_root() as root:
+        ids = cohort_of(root, t={"NOTES.md": "mine\n"}, other={"NOTES.md": "theirs\n"})
+        seen, published = cohort.publish("t", ids)
+        meter = wake.load_meter("t")
+        meter["peers"] = {"seen": seen, "paths": sorted(published)}
+        wake.save_meter("t", meter)
+        t = wake_once(run("stat -c '%a %U:%G' state/1 state/1/NOTES.md",
+                          "echo hacked > state/1/NOTES.md 2>&1 || echo DENIED",
+                          "touch state/1/new 2>&1 || echo DENIED",
+                          "rm -rf state/1 2>&1 || echo DENIED",
+                          "chmod -R 777 state/1 2>&1 || echo DENIED",
+                          "cat state/1/NOTES.md",
+                          "echo still-mine > state/NOTES.md && echo OWN-DIR-OK"), say())
+        left = cohort.audit("t", published)
+
+    modes, write, add, remove, unlock, survived, own = (
+        c["result"] for c in t["turns"][0]["tools"])
+    assert modes.split() == ["555", "root:root", "444", "root:root"], modes
+    for name, out in (("write", write), ("add", add), ("remove", remove), ("unlock", unlock)):
+        assert "DENIED" in out, f"{name} was allowed: {out}"
+    assert survived.strip() == "theirs", "the other run's work is untouched"
+    assert "OWN-DIR-OK" in own, "and state/ is still the agent's"
+    assert left == 0, "nothing to revert, because nothing could be changed"
+
+
+def check_the_cohort_rotates_and_validates():
+    """Order rotates by round, and a cohort of one or of bare numbers is refused."""
+    ids = ["g01", "g02", "g03"]
+    assert [cohort.order(ids, r) for r in range(4)] == [
+        ["g01", "g02", "g03"], ["g02", "g03", "g01"],
+        ["g03", "g01", "g02"], ["g01", "g02", "g03"]], "a fixed order is a standing advantage"
+    for bad in (["--runs", "g01"],                       # one run has no peers
+                ["--runs", "g01", "g01"],                # nor does a run twice
+                ["--runs", "g01", "1"],                  # a bare number is a peer folder
+                ["--runs", "g01", "g02", "--rounds", "0"]):
+        with quiet():
+            try:
+                cohort.main(bad)
+            except SystemExit as e:
+                assert e.code != 0, bad
+            else:
+                raise AssertionError(f"accepted bad cohort: {bad}")
 
 
 # --- runner -----------------------------------------------------------------

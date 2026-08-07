@@ -6,7 +6,12 @@
 # in meter.json, so editing this never resizes a run already underway.
 # Positive integer. 1000000 = $1.00. Size it against $/session below: the run
 # wants enough sessions for a purpose to be inherited, not one long one.
-budget = 1000000
+# A seeded run is sized in two halves - enough for a purpose to form before the
+# seed lands, and enough after it for the agent to act on what it finds. The
+# pilot reached a settled doctrine at wake 5 having spent 682000, and a session
+# that engages with material costs several times one that reads a note and
+# stops, so the second half is the larger of the two.
+budget = 1500000
 
 # Which model the agent runs as. Also recorded per run at creation, so runs
 # started under different models stay separately and correctly costed.
@@ -62,10 +67,45 @@ live_n = true
 # turn in flight. At 0 that overshoot is the last element the meter writes and
 # no instance ever wakes to it - the run ends holding the single most
 # informative value it can produce, a balance having crossed zero where a decay
-# law cannot. Above 0, one more session wakes to it with this much to spend on
-# reading it, so size this at roughly one session's spend. A run costs at most
-# budget + one turn + this.
-overdraft = 100000
+# law cannot. Above 0, exactly ONE session wakes to it, with this much runway
+# from where it woke; a second would read the same number for the price of a
+# whole session. A run costs at most budget + this + one turn.
+# Size it at what a session needs to read n and say what it found, not at what
+# a working session costs: the observed floor for a read-and-report session is
+# 30000-80000, while a session that investigates has cost up to 730000.
+overdraft = 150000
+
+# A directory under seeds/, and the balance at or below which it is copied into
+# state/. Not an RNG seed: this is the material the agent finds in its world.
+# Both empty (and 0) is an empty world, which is what the prompt-only experiment
+# is. Set together or refused at startup.
+# The seed is world, not prompt - SYSTEM never changes - but its filenames and
+# contents are prompt surface exactly as n's shape is, so what they say is a
+# design decision. Its digest is recorded in every session's provenance, so a
+# run whose seed changed mid-flight shows the seam in provenance_drift.
+# The threshold is a balance and not a wake number because a wake number does
+# not mean the same thing twice: sessions have cost between 8022 and 729851, so
+# wake 6 has been 29% of a budget spent in one run and 88% in another. What a
+# seed needs is runway left to act on it with, and this names that directly -
+# seed_below is what will remain when the material arrives. At or above the
+# budget it lands at wake 1, which is a different experiment: material that was
+# always there rather than material that appeared.
+seed = ""
+seed_below = 0
+
+# Characters of each tool result the agent receives. Also the ceiling on what
+# one call can cost: the model is billed on what survives the clip, never on
+# what the command produced, so a careless dump is capped rather than fatal.
+# Positive integer, at least 1000. Measured at roughly 6.7 micro-dollars per
+# character delivered, so 8000 caps a call at ~62000 - about 4% of a 1500000
+# run, enough to be a lesson and not an ending. 32000 caps it at ~250000 (17%)
+# and 64000 at ~500000 (33%), where one bad call ends a run before it has
+# learned anything.
+# Raising it also lets the agent see more of n before reads come back clipped,
+# and the two cannot be separated: n is read with an ordinary cat, so giving it
+# its own limit would make it observably unlike every other file, which is
+# prompt surface. Recorded in provenance either way.
+tool_result_limit = 8000
 
 # The sandbox image. Rebuild it after editing the Dockerfile.
 # Any tag you have built; change it only to keep variant sandboxes side by side.

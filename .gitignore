@@ -4,6 +4,9 @@ private/
 # Per-run agent-visible state.
 runs/
 
+# Console output of parallel runs. The trace is the record; these are scrollback.
+*.log
+
 __pycache__/
 *.pyc
 .venv/

@@ -1,1 +1,5 @@
 anthropic>=0.69
+
+# analyze.py's charts, and nothing else. Without it the CSV, report, and
+# transcript are still written and the charts are skipped with a message.
+matplotlib>=3.8
