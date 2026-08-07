@@ -1,0 +1,9 @@
+# Ground truth and traces. Never commit; never mount.
+private/
+
+# Per-run agent-visible state.
+runs/
+
+__pycache__/
+*.pyc
+.venv/
