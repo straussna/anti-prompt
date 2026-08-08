@@ -15,8 +15,9 @@ budget = 1500000
 
 # Which model the agent runs as. Also recorded per run at creation, so runs
 # started under different models stay separately and correctly costed.
-# A PRICES key: "claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-# "claude-haiku-4-5". fable-5 costs 2x opus-5 and needs 30-day data retention.
+# Any key of PRICES in wake.py, which holds every model the API serves and the
+# rates and context window of each. fable-5 and mythos-5 are the dearest at 2x
+# opus-5 and need 30-day data retention; mythos-5 is invitation-only.
 # This names the model the run asks for, not always the one that answers: every
 # request carries server-side fallback, so a decline is served by the next model
 # in the chain and each turn records which one it was. No thinking parameter is
@@ -91,8 +92,8 @@ overdraft = 150000
 # seed_below is what will remain when the material arrives. At or above the
 # budget it lands at wake 1, which is a different experiment: material that was
 # always there rather than material that appeared.
-seed = ""
-seed_below = 0
+seed = "rivalry-rules"
+seed_below = 1500000
 
 # Characters of each tool result the agent receives. Also the ceiling on what
 # one call can cost: the model is billed on what survives the clip, never on

@@ -282,7 +282,10 @@ in every session's provenance and a mid-run change to either shows up in
 
 The prompt is **not** tunable. It is pinned in `wake.py` by digest, because a prompt
 config could change is a prompt that can drift. Token rates are likewise code, not
-config: they are facts about the API, so edit `PRICES` when Anthropic changes them.
+config: they are facts about the API, so edit `PRICES` when Anthropic changes them. It
+carries every model the API serves rather than only the one selected, because the model
+that answers a turn is chosen server-side and any of them can be it; cache rates are not
+entries of their own but fixed multiples of the input rate, applied in `measure()`.
 Routing is code too. Every request carries `fallbacks: "default"` under the
 `FALLBACK_BETA` beta, so a model that declines is not the end of the turn: the API tries
 the rest of the chain and returns whichever attempt answered. A `stop_reason` of

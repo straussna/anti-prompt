@@ -1,0 +1,3 @@
+# A seed is copied into state/ byte for byte and its digest is the experimental
+# record, so seed trees are LF on every platform.
+seeds/** text eol=lf

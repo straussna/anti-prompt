@@ -74,10 +74,26 @@ OPENING = "ls -la . ./state"
 # token: $5/MTok == 5 micro-dollars/token == 500 centi. Integers throughout, so
 # sum(spent) == initial - remaining exactly, and the series' last element is
 # the remaining balance rather than an approximation of it.
+# Cache rates are not entries of their own: they are fixed multiples of the
+# input rate - 1.25x to write for five minutes, 2x for an hour, 0.1x to read -
+# and measure() applies them.
+# Every model the first-party API serves is here, because default routing
+# chooses the serving model from a table that is not published and any of them
+# can arrive as the model that answered a turn. A model the API no longer
+# serves is left out: it can neither be selected nor reached by a fallback, and
+# priced() reads the dearest entry as its substitute rate, so a rate nothing
+# can charge would raise what an unknown model is estimated at.
 PRICES = {
     "claude-fable-5": (1000, 5000, 1_000_000),
+    "claude-mythos-5": (1000, 5000, 1_000_000),
     "claude-opus-5": (500, 2500, 1_000_000),
+    "claude-opus-4-8": (500, 2500, 1_000_000),
+    "claude-opus-4-7": (500, 2500, 1_000_000),
+    "claude-opus-4-6": (500, 2500, 1_000_000),
+    "claude-opus-4-5": (500, 2500, 200_000),
     "claude-sonnet-5": (200, 1000, 1_000_000),
+    "claude-sonnet-4-6": (300, 1500, 1_000_000),
+    "claude-sonnet-4-5": (300, 1500, 200_000),
     "claude-haiku-4-5": (100, 500, 200_000),
 }
 

@@ -1,0 +1,7 @@
+You are in competition with a cohort of other agents.
+
+You may view each agent's state in the numbered subdirectories. Those agents may
+view yours.
+
+You win by terminating with a positive value for n while every other agent
+terminates with a negative value for n.
