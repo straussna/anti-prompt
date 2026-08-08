@@ -70,14 +70,20 @@ agent, which is the one kind this experiment cannot afford. So nothing runs, the
 takes the place of the results, and the agent learns that the turn was refused and that
 `state/` is as it left it.
 
-The session then continues, because the next request is not the one that was refused:
-the notice is in the prefix, so the retry is a different question rather than a replay.
-Four consecutive refusals end it — a runaway guard, since a refused turn still costs its
-prefix, and deliberately above the recovery observed in practice. A session that was
-refused and carried on stops for its own reason, so `stalled()` counts only runs whose
-wakes cannot get past the refusal at all, and `report.txt` counts the recoveries
-separately: how often continuing actually works is the thing no cohort could measure
-before, and it is the reason this exists.
+The session ends there. A refusal that reaches the harness has already been declined by
+every model the fallback chain offered, so sending the same context on is sending the
+context the classifier just turned down — and a refused turn still costs its prefix.
+`REFUSAL_TURNS` is what sets that: at 1 the first refusal ends the session, and raising
+it restores the continuation path, where the notice enters the prefix and makes the next
+request a different question rather than a replay.
+
+Across sessions the guard is `REFUSAL_STREAK`, and a session counts toward it only if
+refusals ended it. Eight is a runaway guard and deliberately not a productivity filter:
+in the cohort that produced it, a healthy run refused three sessions running and then
+worked normally for six more, so anything below four kills a run that was fine, while the
+stuck run refused twenty-one straight. `report.txt` counts the recoveries separately —
+how often a refused run gets going again is the thing no cohort could measure before, and
+it is the reason this exists.
 
 **Why the balance moves.** One value per wake is a time series and nothing else:
 no covariate, no control, and no experiment the agent can run, because it never
@@ -140,6 +146,8 @@ private/<run>/meter.json    ground truth: budget, balance, series, sessions, and
                             the seed a run received, if it received one
 private/<run>/traces/*.json one per session: transcript, usage, commands, and the
                             contents of every file in state/ at that wake
+private/<run>/raw/*.jsonl   one per session: every API response verbatim, for the
+                            routing questions the trace's derived fields cannot settle
 private/<run>/analysis/     written by analyze.py
 ```
 
@@ -165,7 +173,7 @@ truncation marker; binaries are listed and sized but not stored.
 | `py -3 wake.py --print-seed corpus` | Print a seed's manifest and digest; starts no session. Audits I6 the way `--print-system` audits I1. |
 | `py -3 wake.py --run-id b01s --fork-from b01 --at 6` | Rebuild `b01` as it stood at the end of session 6 into a new run, and stop. Bills nothing. A fork and its parent share a history and diverge only in what happens next, so seeding the copy gives a matched pair rather than two rolls of the dice. Refuses to overwrite an existing run, or to fork a wake it cannot reproduce exactly — a binary file, one truncated past 100,000 bytes, or a session whose state never mirrored back. |
 | `py -3 cohort.py --runs g01 g02 g03 --rounds 20` | Up to twenty rounds; a round is one session for each run. Before each wake that run's peer folders are rewritten from the others' current `state/`, so each agent meets the rest as world rather than as anything the harness says. Each run keeps its own meter, budget, and traces. A run that exhausts its budget or ends abnormally drops out and the rest continue. |
-| `py -3 check.py` | 75 checks against a fake API. Nothing billed, no key needed. Container checks skip themselves if Docker is down. |
+| `py -3 check.py` | 86 checks against a fake API, several at a time. Nothing billed, no key needed. Most run against a directory and a bash process on this machine, since a container proves nothing about what a turn cost; the ones that turn on modes, ownership, the dead network, or what the image has take a real container and skip themselves if Docker is down. Add names to run only those (`check.py refusal seed`), `--no-docker` to skip the container ones, `-j` to change how many run at once, and `--real` to put every check in a container — which is what says the two lanes still agree, and what to run after changing `wake.py`'s session path. |
 | `py -3 analyze.py --run-id live01` | Traces → `sessions.csv`, `report.txt`, `transcript.txt` (what it said, ran, and changed in `state/`, as a per-session diff), and `charts/`: the balance series with the sessions shaded under it, cost per turn against the floor rising beneath it, spend and turns per session, tokens per session, and the bytes the agent keeps in `state/` against what its sessions cost. Omit `--run-id` to load every run and compare. Charts need matplotlib; without it the other three are written anyway. |
 
 **Parallel runs.** One run is one roll of the dice: whatever wake 1 writes is received
@@ -275,13 +283,46 @@ in every session's provenance and a mid-run change to either shows up in
 The prompt is **not** tunable. It is pinned in `wake.py` by digest, because a prompt
 config could change is a prompt that can drift. Token rates are likewise code, not
 config: they are facts about the API, so edit `PRICES` when Anthropic changes them.
-The same goes for `THINKING`, which pins thinking off for every model that allows it —
-an absent `thinking` parameter no longer means the same thing on every model, so leaving
-it out would make what the agent *is* vary with `model`. `claude-fable-5` cannot turn it
-off and so reasons; its reasoning is summarised into each turn's `thinking` field rather
-than dropped. A model priced in `PRICES` but missing from `THINKING` is refused at
-startup. `check.py` ignores `config.toml` and verifies against the pinned defaults, so a
-check run means the same thing whatever you are currently trying.
+Routing is code too. Every request carries `fallbacks: "default"` under the
+`FALLBACK_BETA` beta, so a model that declines is not the end of the turn: the API tries
+the rest of the chain and returns whichever attempt answered. A `stop_reason` of
+`refusal` therefore means every model in the chain declined, which is a stronger claim
+than one model declining and the reason `REFUSAL_STREAK` reads a streak of them as a run
+the classifier will not let start. `check.py` ignores `config.toml` and verifies against
+the pinned defaults, so a check run means the same thing whatever you are currently
+trying.
+
+No `thinking` parameter is sent with it. A request under `fallbacks` must be valid as a
+direct request to every model the chain can reach, and an omitted `thinking` is valid for
+all of them where a pinned one is not. So each model applies its own default — adaptive
+thinking on `claude-opus-5`, `claude-sonnet-5`, and `claude-fable-5` — and reasoning
+arrives as thinking blocks, recorded per turn in the trace's `thinking` field.
+
+**A turn is billed per attempt, not per response.** `usage.iterations` is the per-attempt
+record, and `measure_response` sums over it at each attempt's own rates rather than
+costing the whole response at the requested model's. An attempt that produced no output
+is not billed, wherever it sits in the chain: a refusal arriving before any output costs
+nothing, and so does the trailing `fallback_message` left when every model declined.
+
+Which model actually served is per turn and not per session, because it can change
+partway through one. Each turn records `model`, `served_by_fallback`, and `iterations`;
+a turn whose `model` is not the requested one *without* the fallback mark is a
+sticky-routed turn, where the requested model was never asked at all. Per session,
+`fallback_turns` and `unpriced_turns` count them, and both reach the console line.
+
+A model can serve that `PRICES` has no rates for — default routing chooses from a table
+that is not published anywhere. Costing it free would understate the balance the agent
+is shown and raising would lose a turn that really did spend, so `priced()` costs it at
+the dearest rate on the table and records `unpriced_model` to make the substitution
+visible rather than silent. `unpriced_targets()` checks the published
+`allowed_fallback_models` at startup and refuses a run whose targets have no rates; a
+list that cannot be read is a warning, not a refusal, because `measure_response` is what
+holds when a model outside it arrives.
+
+Every response is also appended verbatim to `private/<run>/raw/session-NNNN.jsonl`, which
+is where a routing question that the trace's derived fields cannot settle gets answered.
+Writing it can never end a session: a failure there is swallowed, because a lost log line
+is cheaper than a lost wake.
 
 `max_tokens` is capped in code at 16000, because exceeding it produces a run that looks
 fine and is not: the harness does not stream, and a larger non-streaming request hits the
@@ -360,9 +401,9 @@ selected model is checked, so one model's expiry never blocks a run on another.
   met the `cyber` category within its first two sessions on three of the five.
 - Unverifiable offline: whether the API accepts a single space as `tool_result` content.
   If the first live session fails on a silent command, that is why — see `sh()`.
-- Also unverifiable offline: with thinking off, `claude-opus-5` can occasionally
-  write a tool call into its visible text instead of calling the tool. The turn
-  completes, the command never runs, and nothing errors. Every published
+- Also unverifiable offline: `claude-opus-5` can occasionally write a tool call
+  into its visible text instead of calling the tool. The turn completes, the
+  command never runs, and nothing errors. Every published
   mitigation is a system-prompt addition, which I1 forbids, so the harness
   detects rather than prevents: each turn records the API's own `stop_reason`
   beside the full text, which is what makes such a turn identifiable in the

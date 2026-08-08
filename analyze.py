@@ -137,6 +137,35 @@ def refusal_cell(t: dict) -> str:
     return ";".join(dict.fromkeys(category_of(tu) for tu in refused_turns_of(t)))
 
 
+def fallback_turns_of(t: dict) -> list[dict]:
+    """The turns a fallback model answered.
+
+    Read from the turns and not from a session count, because which model
+    answered is a per-turn fact: one session can be served by several.
+    """
+    return [tu for tu in t["turns"] if tu.get("served_by_fallback")]
+
+
+def served_cell(t: dict) -> str:
+    """Every model that answered a turn this session, as one CSV cell, in order.
+
+    Blank for a trace predating the per-turn model, which is not the same as a
+    session the requested model served alone.
+    """
+    return ";".join(dict.fromkeys(tu["model"] for tu in t["turns"] if tu.get("model")))
+
+
+def unpriced_models_of(t: dict) -> list[str]:
+    """Every model that served a turn this session with no rates in PRICES.
+
+    What these cost is an estimate at the dearest rate on the table rather than
+    a known price, so a session that saw one is costed differently from one that
+    did not, and the models are named rather than counted.
+    """
+    return list(dict.fromkeys(m for tu in t["turns"]
+                              for m in (tu.get("unpriced_model") or [])))
+
+
 def row(t: dict) -> dict:
     """Flatten one trace into a CSV row, summing per-turn token counts."""
     agent = agent_files_of(t)
@@ -150,6 +179,12 @@ def row(t: dict) -> dict:
         # Blank means a trace predating the field, which is not the same as a
         # session that met no refusal.
         "refused_turns": t.get("refused_turns", ""),
+        # Likewise blank for a trace from before fallback routing, which is not
+        # the same as a session the requested model served throughout.
+        "fallback_turns": t.get("fallback_turns", ""),
+        "unpriced_turns": t.get("unpriced_turns", ""),
+        "served_models": served_cell(t),
+        "unpriced_models": ";".join(unpriced_models_of(t)),
         "started_at": prov.get("started_at", ""),
         "model_resolved": t.get("model_resolved") or "",
         "image_id": (prov.get("image_id") or "")[:19],
@@ -215,6 +250,7 @@ def report(runs: dict[str, list[dict]]) -> str:
             f"  stop reasons          : {stops}",
             *segment_lines(ts),
             *refusal_lines(ts),
+            *fallback_lines(ts),
             f"  files the agent made  : {made or 'none'}",
             f"  reached for, absent   : {absent(ts)}",
         ]
@@ -295,6 +331,37 @@ def refusal_lines(ts: list[dict]) -> list[str]:
     return out
 
 
+def fallback_lines(ts: list[dict]) -> list[str]:
+    """Which models actually answered, and what the run was charged for guessing.
+
+    Read beside the refusals directly above: those are the turns where the whole
+    chain declined, and these are the turns where it did not, so the pair is
+    what says whether routing is doing anything. A run where the requested model
+    answered throughout says so in one line.
+
+    A served model with no rates in PRICES is named on a line of its own,
+    because its cost is the dearest rate on the table standing in for a price
+    that is not known - a total containing one is an upper bound and not a
+    figure.
+    """
+    if not any("fallback_turns" in t for t in ts):
+        return ["  served by fallback    : not recorded for this run"]
+    served = [t for t in ts if fallback_turns_of(t)]
+    turns = sum(len(fallback_turns_of(t)) for t in served)
+    tally = collections.Counter(tu["model"] for t in ts for tu in t["turns"]
+                                if tu.get("model"))
+    out = [f"  served by fallback    : {turns} turns in {len(served)} of {len(ts)} sessions"]
+    if tally:
+        out.append(f"    models that answered: {dict(tally.most_common())}")
+    if unpriced := sorted({m for t in ts for m in unpriced_models_of(t)}):
+        sessions = [t["session"] for t in ts if unpriced_models_of(t)]
+        out += [f"    no rates in PRICES  : {', '.join(unpriced)}"
+                f" - sessions {sessions[:10]}",
+                "    those turns are costed at the dearest rate in PRICES; the"
+                " totals above are upper bounds"]
+    return out
+
+
 def rewrote_in_turn(ts: list[dict]) -> str:
     """Sessions whose per-turn writes of n found the agent had changed it.
 
@@ -364,7 +431,7 @@ def provenance_lines(ts: list[dict]) -> list[str]:
     """
     fields = ["model_resolved", "image_id", "prices", "context_fraction",
               "max_tokens", "turn_cap", "timeout", "tool_result_limit", "live_n",
-              "overdraft", "harness_sha256", "thinking"]
+              "overdraft", "harness_sha256", "fallbacks"]
     out, drifted = [], sorted({d.split(":")[0] for t in ts for d in t.get("provenance_drift") or []})
     for f in fields:
         seen = [t.get(f) if f == "model_resolved" else (t.get("provenance") or {}).get(f) for t in ts]

@@ -23,6 +23,7 @@ This is a pass-through to the Messages API plus four rules:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -86,17 +87,15 @@ PRICES_EXPIRE = {
     "claude-sonnet-5": ("2026-08-31", "(300, 1500) from 2026-09-01"),
 }
 
-# model -> the thinking parameters sent with every request. Pinned rather than
-# omitted: an absent `thinking` runs adaptive thinking on opus-5, sonnet-5, and
-# fable-5, which would make what the agent *is* vary by model. Off wherever the
-# model accepts it. fable-5 rejects "disabled" and always thinks, so its
-# reasoning is summarised into the record rather than left blank.
-THINKING = {
-    "claude-fable-5": {"thinking": {"type": "adaptive", "display": "summarized"}},
-    "claude-opus-5": {"thinking": {"type": "disabled"}},
-    "claude-sonnet-5": {"thinking": {"type": "disabled"}},
-    "claude-haiku-4-5": {},      # pre-adaptive: absent already means no thinking
-}
+# No `thinking` parameter is sent. Server-side fallback picks the serving model
+# per refusal category, and a request must be valid as a direct request to every
+# model it can reach; an omitted `thinking` is valid for all of them. Each model
+# applies its own default, which for opus-5, sonnet-5, and fable-5 is adaptive
+# thinking. Reasoning arrives as thinking blocks and is recorded per turn.
+
+# The beta that enables the `fallbacks` parameter. The date is exact: under any
+# other server-side-fallback-* value the parameter is rejected with a 400.
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 ROOT = Path(__file__).resolve().parent
 
@@ -127,6 +126,18 @@ IMAGE = "metered-agent:latest"
 TUNABLES = {"BUDGET", "MODEL", "CONTEXT_FRACTION", "MAX_TOKENS", "TURN_CAP", "TIMEOUT",
             "LIVE_N", "OVERDRAFT", "SEED", "SEED_BELOW", "TOOL_RESULT_LIMIT", "IMAGE"}
 
+# Not tunable from config.toml: these say how a driver runs sessions, not what a
+# run is, and nothing in a meter.json or a trace depends on them.
+
+# Leads every session container's name. A driver running several runs at once
+# gives each process its own, so that reaping one run's container cannot take
+# another's with it.
+CONTAINER_PREFIX = "mtr-"
+
+# The base of call()'s backoff, in seconds. Zero retries without waiting, which
+# is what a driver that scripts its own API errors wants.
+RETRY_BASE = 2
+
 # Hard ceiling on MAX_TOKENS. The harness does not stream, and a non-streaming
 # request much above this hits the SDK's HTTP timeout.
 MAX_TOKENS_CEILING = 16_000
@@ -134,6 +145,11 @@ MAX_TOKENS_CEILING = 16_000
 # Below this a clipped read of n cannot keep a usable head, and clip()'s marker
 # would crowd out the content it is marking.
 TOOL_RESULT_FLOOR = 1_000
+
+# Seconds the harness gives its own first command in a new session. Not TIMEOUT:
+# that bounds the agent's commands and a run may tune it to seconds, while this
+# waits on a container that has just started and may be one of several.
+STARTUP_TIMEOUT = 30
 
 # Bytes of each file captured per session in the trace. The true size is
 # recorded whether or not the content fits.
@@ -152,16 +168,23 @@ RETRYABLE = {"APIConnectionError", "APITimeoutError", "ConnectionError", "Timeou
 # refused and carried on is not part of a streak. See stalled().
 REFUSAL_STREAK = 8
 
-# Consecutive refused turns after which a session stops rather than spend more
-# of the balance on turns that cannot act. A refused turn is billed for its
-# whole prefix, so this is a budget guard and not only a wall-clock one. See
-# session().
-REFUSAL_TURNS = 4
+# Consecutive refused turns after which a session stops. A refusal that reaches
+# the harness has already been through the fallback chain, so the same context
+# sent again is the same context the classifier just declined. At 1 the session
+# ends on the first one. See session().
+REFUSAL_TURNS = 1
 
 # Session outcomes that end a --sessions loop. Everything else - end_turn,
 # context_threshold, turn_cap, max_tokens, no_tool_call, refusal,
 # meter_exhausted - is a session that happened, and the next one follows.
 STOP_THE_RUN = {"interrupted", "api_error", "harness_error"}
+
+# The stop reasons session() knows how to act on. max_tokens and refusal have
+# branches of their own before this is consulted; the rest mean the turn is
+# whole, and what happens next is decided by whether it called a tool. Anything
+# outside this set ends the session as unhandled:<reason> rather than being read
+# as an ordinary finished turn.
+HANDLED_STOPS = {"end_turn", "tool_use", "stop_sequence", "max_tokens", "refusal", None}
 
 # N_REF scores commands, where the shell resolves a bare n as a path. N_PATH
 # scores prose, where n is an ordinary variable name too, so only the file
@@ -199,9 +222,6 @@ def load_config(path: Path | None = None) -> Path | None:
         globals()[name] = value
     if MODEL not in PRICES:
         raise SystemExit(f"{f}: model {MODEL!r} has no rates; add it to PRICES in wake.py")
-    if MODEL not in THINKING:
-        raise SystemExit(f"{f}: model {MODEL!r} has no thinking policy; add it to THINKING in "
-                         f"wake.py, or the model's own default silently decides whether it thinks")
     if not 0 < CONTEXT_FRACTION <= 1:
         raise SystemExit(f"{f}: context_fraction must be in (0, 1], got {CONTEXT_FRACTION}")
     if min(BUDGET, MAX_TOKENS, TURN_CAP, TIMEOUT) <= 0:
@@ -439,6 +459,74 @@ def measure(usage: Any, model: str) -> dict:
     }
 
 
+def priced(model: str) -> tuple[str, bool]:
+    """`model` if PRICES has rates for it, else the dearest model that does.
+
+    Default fallback routing chooses the serving model server-side, from a table
+    that is not published, so a model with no entry in PRICES can serve a turn
+    at any time. Costing it as free would understate the balance the agent is
+    shown, and raising would lose the cost of a turn that really did spend, so
+    it is costed at the highest rate on the table instead. The bool is what
+    makes that substitution visible in the trace rather than silent.
+    """
+    if model in PRICES:
+        return model, False
+    return max(PRICES, key=lambda m: PRICES[m][1]), True
+
+
+def measure_response(r: Any, model: str) -> dict:
+    """Cost a whole response, one attempt at a time.
+
+    A response can carry several attempts: the requested model declining, then
+    whichever model the fallback ran. usage.iterations is the per-attempt record,
+    and each attempt is billed at the rates of the model that ran it, so the
+    totals here are a sum over that array rather than the top-level counts read
+    at one model's prices.
+
+    An attempt that produced no output is not billed. That holds wherever it
+    sits in the array and whatever its type: when every model in a chain
+    declines, the last attempt is a fallback_message with no output, and it is
+    as unbilled as the plain refusal that would arrive with no chain at all.
+
+    `prefix` comes from the top-level usage, which describes the attempt that
+    produced the returned message. It is the size of the context that was
+    actually served, which is what the session's context ceiling is about.
+    """
+    usage = getattr(r, "usage", None)
+    top = measure(usage, priced(model)[0])
+    iterations = list(getattr(usage, "iterations", None) or [])
+
+    if not iterations:
+        # No chain ran. A refusal that arrives before any output is not billed;
+        # its token counts are reported all the same, and are kept here.
+        empty = getattr(r, "stop_reason", None) == "refusal" and not (getattr(r, "content", None) or [])
+        return {**top, "centi": 0 if empty else top["centi"], "unpriced": []}
+
+    centi, unpriced = 0, []
+    for it in iterations:
+        served, substituted = priced(getattr(it, "model", None) or model)
+        if substituted:
+            unpriced.append(getattr(it, "model", None))
+        # No output, no charge: the attempt declined before producing any.
+        if int(getattr(it, "output_tokens", 0) or 0):
+            centi += measure(it, served)["centi"]
+    return {**top, "centi": centi, "unpriced": unpriced}
+
+
+def served_by_fallback(r: Any) -> bool:
+    """Whether a fallback model produced this response.
+
+    A fallback_message entry means a fallback attempt ran; pairing it with the
+    stop reason is what distinguishes one that answered from one that declined
+    in its turn. True also for a sticky-routed turn, where the requested model
+    was never asked and so no attempt of its own appears.
+    """
+    usage = getattr(r, "usage", None)
+    ran = any(getattr(it, "type", None) == "fallback_message"
+              for it in (getattr(usage, "iterations", None) or []))
+    return ran and getattr(r, "stop_reason", None) != "refusal"
+
+
 # --- the container ----------------------------------------------------------
 
 
@@ -596,7 +684,13 @@ def provenance(model: str, peers: dict[str, str] | None = None) -> dict:
         "image": IMAGE,
         "image_id": image_id(IMAGE),
         "prices": list(PRICES[model]),
-        "thinking": THINKING[model],
+        # No thinking parameter is sent, so each model applies its own default.
+        # What decides which model answers a declined turn is recorded instead:
+        # under default routing a session can be served by a model this run
+        # never named, and two sessions that disagree here are not one
+        # experiment any more than two on different rates would be.
+        "fallbacks": "default",
+        "fallback_beta": FALLBACK_BETA,
         "context_fraction": CONTEXT_FRACTION,
         "max_tokens": MAX_TOKENS,
         "turn_cap": TURN_CAP,
@@ -616,8 +710,14 @@ def provenance(model: str, peers: dict[str, str] | None = None) -> dict:
     }
 
 
+@functools.cache
 def image_id(image: str) -> str | None:
-    """The image's content digest. The tag is a moving target; this is not."""
+    """The image's content digest. The tag is a moving target; this is not.
+
+    Asked of the daemon once per image per process: provenance() wants it at
+    every wake, and a tag cannot be rebuilt underneath a process that is already
+    running sessions against it.
+    """
     r = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],
                        capture_output=True, text=True)
     return r.stdout.strip() or None
@@ -693,20 +793,25 @@ def load_state(container: str, state: Path, locked: list[str] = ()) -> None:
                    check=True, capture_output=True)
 
 
-def save_state(container: str, state: Path) -> bool:
-    """Mirror the container's state back to the host. Never raises.
+def save_state(state: Path, fetch: Callable[[Path], bool],
+               modes: Callable[[], str | None]) -> bool:
+    """Mirror a session's state back to the host. Never raises.
 
     The copy is staged in a sibling directory and swapped in whole, so the
-    result is the container's state exactly, including deletions. Returns False
+    result is the session's state exactly, including deletions. Returns False
     if the mirror was not updated; the trace records that as state_saved.
+
+    `fetch(dest)` copies the session's files into `dest` and says whether it
+    could; `modes()` returns the mode listing to keep in the sidecar, or None
+    where the session ran somewhere that has no modes worth keeping. The swap
+    below is the same either way, which is what makes it the same guarantee.
     """
     incoming, previous = state.with_name("state.incoming"), state.with_name("state.previous")
     try:
         shutil.rmtree(incoming, ignore_errors=True)
         shutil.rmtree(previous, ignore_errors=True)
         incoming.mkdir(parents=True, exist_ok=True)
-        if subprocess.run(["docker", "cp", f"{container}:/work/state/.", str(incoming)],
-                          capture_output=True).returncode:
+        if not fetch(incoming):
             return False
         # The container's modes come back with the files, and the locked ones
         # are read-only. On the host they mean nothing - the sidecar below is
@@ -718,12 +823,9 @@ def save_state(container: str, state: Path) -> bool:
             os.chmod(p, 0o777 if p.is_dir() else 0o666)
         # Read the modes from inside, where they are still real, before the copy
         # lands on a filesystem that cannot represent them.
-        listing = subprocess.run(
-            ["docker", "exec", container, "find", "/work/state", "-mindepth", "1",
-             "-printf", "%m %P\\n"],
-            capture_output=True, text=True, errors="replace")
-        if listing.returncode == 0:
-            modes_file(state).write_text(listing.stdout, encoding="utf-8", newline="\n")
+        listing = modes()
+        if listing is not None:
+            modes_file(state).write_text(listing, encoding="utf-8", newline="\n")
         if state.exists():
             state.replace(previous)
         incoming.replace(state)
@@ -736,6 +838,60 @@ def save_state(container: str, state: Path) -> bool:
         shutil.rmtree(incoming, ignore_errors=True)
         shutil.rmtree(previous, ignore_errors=True)
         state.mkdir(parents=True, exist_ok=True)
+
+
+class Container:
+    """The world a session runs in: started, loaded, mirrored back, reaped.
+
+    run_once holds one of these for the length of a session, and these five
+    methods are everything it asks of one. A driver that needs a session
+    somewhere other than Docker puts its own class in BOX.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    @classmethod
+    def start(cls, name: str) -> "Container":
+        """Create the container and return it. Raises if it will not start."""
+        # A name left behind by a crashed run would otherwise fail the create,
+        # and a run that cannot be started again is worse than a stale reap.
+        reap(name)
+        # Nothing is mounted: the container sees only what load() copies in, on
+        # its own filesystem, with real modes and ownership. --network none is I5.
+        subprocess.run(["docker", "run", "-d", "--name", name, "--network", "none",
+                        "--pids-limit", "512", "-w", "/work", IMAGE, "sleep", "infinity"],
+                       check=True, capture_output=True)
+        return cls(name)
+
+    def load(self, state: Path, locked: list[str]) -> None:
+        load_state(self.name, state, locked)
+
+    def shell(self) -> Shell:
+        return Shell(self.name)
+
+    def save(self, state: Path) -> bool:
+        return save_state(state, self._fetch, self._modes)
+
+    def _fetch(self, dest: Path) -> bool:
+        return not subprocess.run(["docker", "cp", f"{self.name}:/work/state/.", str(dest)],
+                                  capture_output=True).returncode
+
+    def _modes(self) -> str | None:
+        r = subprocess.run(
+            ["docker", "exec", self.name, "find", "/work/state", "-mindepth", "1",
+             "-printf", "%m %P\\n"],
+            capture_output=True, text=True, errors="replace")
+        return r.stdout if r.returncode == 0 else None
+
+    def close(self) -> None:
+        reap(self.name)
+
+
+# What run_once starts a session in. A module global rather than an argument
+# because run_sessions and drive sit between run_once and every caller, and
+# neither has any business knowing about it.
+BOX = Container
 
 
 class Shell:
@@ -755,13 +911,25 @@ class Shell:
         self.container, self.proc, self.buf = container, None, bytearray()
         self.restart()
 
+    def argv(self) -> list[str]:
+        """The command that is the shell. A session running somewhere other than
+        a container overrides this and inherits the framing below."""
+        return ["docker", "exec", "-i", self.container, "bash"]
+
+    def popen_kwargs(self) -> dict:
+        """Anything else that command needs to start where the session is."""
+        return {}
+
+    def republish_n(self, series: list[int], expected: str) -> str:
+        """Rewrite n where the session can see it, mid-session. See publish_n_live."""
+        return publish_n_live(self.container, series, expected)
+
     def restart(self) -> None:
         """Start a fresh shell, losing cwd and exports - which is what restart is."""
         self.close()
         self.proc = subprocess.Popen(
-            ["docker", "exec", "-i", self.container, "bash"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, bufsize=0)
+            self.argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, bufsize=0, **self.popen_kwargs())
         self.buf = buf = bytearray()
         threading.Thread(target=self._drain, args=(self.proc, buf), daemon=True).start()
 
@@ -884,7 +1052,47 @@ def call(create: Callable, params: dict, log: list) -> Any:
             if not retryable or attempt == 5:
                 raise
             log.append({"attempt": attempt, "error": type(e).__name__, "status": status})
-            time.sleep(min(60, 2 ** attempt) * (1 + random.random() * 0.25))
+            time.sleep(min(60, RETRY_BASE ** attempt) * (1 + random.random() * 0.25))
+
+
+# --- the raw log ------------------------------------------------------------
+
+
+def dump(r: Any) -> Any:
+    """A response as JSON-able data, whatever kind of object carried it.
+
+    The SDK's models serialise themselves; the fake API in check.py answers with
+    a plain namespace and does not. Both end up as the same shape of data here.
+    """
+    for name in ("to_dict", "model_dump"):
+        fn = getattr(r, name, None)
+        if callable(fn):
+            return fn(mode="json") if name == "model_dump" else fn()
+    return json.loads(json.dumps(r, default=lambda o: getattr(o, "__dict__", None) or str(o)))
+
+
+def log_raw(path: Path | None, turn: int, r: Any) -> None:
+    """Append one response to the session's raw log, verbatim.
+
+    Written before the response is read for anything else, so a turn that goes
+    on to fail is on disk in the form it arrived rather than only in whatever
+    the failure left behind. The trace clips text and keeps named fields; this
+    keeps everything, and is the copy to reach for when a refusal needs
+    explaining.
+
+    Never raises: the log is a record of the run, not part of it, and a session
+    that is spending money does not stop because a line could not be appended.
+    """
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = {"turn": turn, "received": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "response": dump(r)}
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line, default=str) + "\n")
+    except Exception as e:                     # noqa: BLE001 - see docstring
+        print(f"  raw log: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 # --- the session ------------------------------------------------------------
@@ -898,6 +1106,11 @@ def refusal_detail(r: Any) -> dict | None:
     declining, and the model itself declining. `category` is what tells them
     apart, so a refusal without it cannot be classified afterwards at all.
 
+    `recommended_model` is set where a fallback attempt was skipped because the
+    model it would have used was rate limited or overloaded, and names one to
+    retry directly. Its presence is the difference between a category with no
+    fallback and a fallback that could not be reached.
+
     Read attribute by attribute rather than dumping the object, so the fake API
     in check.py - which answers with a plain namespace - is measured the same
     way the SDK's own model is.
@@ -905,7 +1118,8 @@ def refusal_detail(r: Any) -> dict | None:
     d = getattr(r, "stop_details", None)
     if d is None:
         return None
-    return {k: getattr(d, k, None) for k in ("type", "category", "explanation")}
+    return {k: getattr(d, k, None) for k in
+            ("type", "category", "explanation", "recommended_model", "fallback_credit_token")}
 
 
 def refusal_category(turns: list[dict]) -> str:
@@ -928,8 +1142,13 @@ def blocks(content: list, kind: str, field: str) -> str:
                      if getattr(b, "type", "") == kind)
 
 
-def session(create: Callable, shell: Shell, meter: dict, index: int) -> dict:
-    """Drive one session. API failures are recorded in the returned dict."""
+def session(create: Callable, shell: Shell, meter: dict, index: int,
+            raw: Path | None = None) -> dict:
+    """Drive one session. API failures are recorded in the returned dict.
+
+    `raw` is the file every response is appended to verbatim, or None to keep no
+    such record.
+    """
     model, remaining = meter["model"], meter["remaining"]
     limit = int(PRICES[model][2] * CONTEXT_FRACTION)
     # The balance at which this session stops: zero with budget left, and
@@ -950,6 +1169,13 @@ def session(create: Callable, shell: Shell, meter: dict, index: int) -> dict:
                            # the session: a session that was refused and carried
                            # on records them and stops for its own reason.
                            "refused_turns": 0,
+                           # Turns a fallback model answered, and turns costed at
+                           # a substitute rate because the model that served them
+                           # is not in PRICES. A refusal is an HTTP 200 and shows
+                           # up in no error count, so the pair of these beside
+                           # refused_turns is the whole of what the run reports
+                           # about the classifier.
+                           "fallback_turns": 0, "unpriced_turns": 0,
                            # The balance after each billed turn, in order: the
                            # elements this session adds to the series.
                            "balances": []}
@@ -978,15 +1204,31 @@ def session(create: Callable, shell: Shell, meter: dict, index: int) -> dict:
                 "messages": messages, "tools": [TOOL],
                 # Auto-places on the newest turn.
                 "cache_control": {"type": "ephemeral"},
-                **THINKING[model],
+                # A declined turn is retried inside this same call, on whichever
+                # model the category recommends. Sent on every request rather
+                # than held in a flag somewhere: one call site that always sets
+                # it cannot fall out of step with one that forgets.
+                "fallbacks": "default",
+                "betas": [FALLBACK_BETA],
             }, out["retries"])
+            # Before the response is read for anything: a turn that fails below
+            # is still on disk exactly as it arrived.
+            log_raw(raw, turn, r)
 
             # Cost is committed per response id, once. The token counts are
             # zeroed with it, so they reconcile with spent.
             rid = getattr(r, "id", None) or f"anon-{turn}"
             stop_reason = getattr(r, "stop_reason", None)
-            out["model_resolved"] = out["model_resolved"] or getattr(r, "model", None)
-            u = measure(r.usage, model)
+            served = getattr(r, "model", None)
+            out["model_resolved"] = out["model_resolved"] or served
+            u = measure_response(r, model)
+            fallback = served_by_fallback(r)
+            out["fallback_turns"] += fallback
+            if u["unpriced"]:
+                out["unpriced_turns"] += 1
+                print(f"  {', '.join(str(m) for m in u['unpriced'])} served a turn and has no "
+                      f"rates; costed at the dearest in PRICES. Add it to PRICES in wake.py.",
+                      file=sys.stderr)
             if rid not in seen:
                 seen.add(rid)
                 centi += u["centi"]
@@ -999,13 +1241,21 @@ def session(create: Callable, shell: Shell, meter: dict, index: int) -> dict:
             # the spend. A duplicate reads 0, since it moved nothing.
             previous, balance = balance, remaining - centi // 100
 
-            # Reasoning is kept apart from spoken words, and only fable-5
-            # produces any. stop_reason is the API's own, recorded verbatim: the
-            # derived session `stop` below cannot on its own tell a finished
-            # turn from a truncated one.
+            # Reasoning is kept apart from spoken words. stop_reason is the
+            # API's own, recorded verbatim: the derived session `stop` below
+            # cannot on its own tell a finished turn from a truncated one.
+            # `model` is per turn rather than per session because the model that
+            # answers can change partway through one: served_by_fallback marks
+            # the turn a fallback answered, and a turn where `model` is not the
+            # requested one without that mark is a sticky-routed turn, where the
+            # requested model was never asked at all.
             rec = {"turn": turn, "id": rid, "micros": previous - balance, "prefix": u["prefix"],
                    "stop_reason": stop_reason, "stop_details": refusal_detail(r),
-                   "balance": balance,
+                   "balance": balance, "model": served,
+                   "served_by_fallback": fallback, "unpriced_model": u["unpriced"] or None,
+                   # The per-attempt billing record behind micros.
+                   "iterations": [dump(it) for it in
+                                  (getattr(getattr(r, "usage", None), "iterations", None) or [])],
                    "text": clip(blocks(content, "text", "text"), 20_000),
                    "thinking": clip(blocks(content, "thinking", "thinking"), 20_000),
                    "tools": [], **{k: u[k] for k in BILLABLE}}
@@ -1030,8 +1280,8 @@ def session(create: Callable, shell: Shell, meter: dict, index: int) -> dict:
             if LIVE_N:
                 # What this write should be replacing is what the last one left:
                 # the series without the element this turn just added.
-                status = publish_n_live(shell.container, meter["series"] + out["balances"],
-                                        render_n(meter["series"] + out["balances"][:-1]))
+                status = shell.republish_n(meter["series"] + out["balances"],
+                                           render_n(meter["series"] + out["balances"][:-1]))
                 if status == "failed":
                     out["live_n_errors"] += 1
                 else:
@@ -1057,12 +1307,15 @@ def session(create: Callable, shell: Shell, meter: dict, index: int) -> dict:
                 if refused >= REFUSAL_TURNS:
                     out["stop"] = "refusal"
                     break
-                # Nothing runs. A refusal can arrive with a tool call already
-                # emitted and cut mid-JSON, so what that call would execute is
-                # not what the agent wrote, and the notice takes the place of
-                # the results it would have returned. The tool_result form is
-                # required wherever the turn carried calls: the API refuses a
-                # reply that leaves a tool_use unanswered.
+                # Dormant at REFUSAL_TURNS of 1, where the break above always
+                # fires first. What runs if the tunable is raised again:
+                # nothing of the turn is executed, and because a refusal can
+                # arrive with a tool call already emitted and cut mid-JSON, what
+                # that call would execute is not what the agent wrote. The
+                # notice takes the place of the results it would have returned.
+                # The tool_result form is required wherever the turn carried
+                # calls: the API refuses a reply that leaves a tool_use
+                # unanswered.
                 messages.append({"role": "user", "content": (
                     [{"type": "tool_result", "tool_use_id": b.id,
                       "content": REFUSAL_NOTICE, "is_error": True} for b in calls]
@@ -1073,6 +1326,14 @@ def session(create: Callable, shell: Shell, meter: dict, index: int) -> dict:
                     break
                 continue
             refused = 0
+
+            if stop_reason not in HANDLED_STOPS:
+                # A reason this loop has no branch for. Named rather than read
+                # as the absence of tool calls below, which would file it as
+                # end_turn and lose the fact that the session ended for a reason
+                # the harness does not know how to continue from.
+                out["stop"] = f"unhandled:{stop_reason}"
+                break
 
             if not calls:
                 # Text with no tool call. On turn one that is no_tool_call;
@@ -1152,20 +1413,20 @@ def run_once(run: str, create: Callable, audit: Callable | None = None) -> dict:
     for line in drifted:
         print(f"  provenance drift, {run} session {index}: {line}", file=sys.stderr)
 
-    container = f"mtr-{run}-{index:04d}"
-    reap(container)
-    # Nothing is mounted: the container sees only what load_state copies in, on
-    # its own filesystem, with real modes and ownership. --network none is I5.
-    subprocess.run(["docker", "run", "-d", "--name", container, "--network", "none",
-                    "--pids-limit", "512", "-w", "/work", IMAGE, "sleep", "infinity"],
-                   check=True, capture_output=True)
+    container = BOX.start(f"{CONTAINER_PREFIX}{run}-{index:04d}")
     started, shell, out = time.time(), None, {}
     try:
-        load_state(container, state, list((meter.get("peers") or {}).get("seen") or {}))
-        shell = Shell(container)
-        if sh(shell, "test -w /work/state && echo ok").strip() != "ok":
-            raise RuntimeError("/work/state is not writable; the agent could not persist anything")
-        out = session(create, shell, meter, index)
+        container.load(state, list((meter.get("peers") or {}).get("seen") or {}))
+        shell = container.shell()
+        # Relative to the shell's own working directory, which is where the
+        # agent's commands land and so the only place worth asking about.
+        # TIMEOUT bounds the agent's commands; this one is the harness asking
+        # whether the session can start at all, and a run tuned down to a couple
+        # of seconds must not read a slow first exec as an unusable container.
+        if shell.run("test -w state && echo ok", STARTUP_TIMEOUT).strip() != "ok":
+            raise RuntimeError("state/ is not writable; the agent could not persist anything")
+        out = session(create, shell, meter, index,
+                      priv / "raw" / f"session-{index:04d}.jsonl")
     finally:
         # While the container is still up, and after the last billed turn: this
         # asks the image a question, never the model.
@@ -1174,8 +1435,8 @@ def run_once(run: str, create: Callable, audit: Callable | None = None) -> dict:
             shell.close()
         # Before the reap, on every path: the container holds the only copy of
         # whatever the agent wrote, crashed session or not.
-        saved = save_state(container, state)
-        reap(container)
+        saved = container.save(state)
+        container.close()
 
     # Not clamped at zero; a call in flight can overshoot. One element per turn,
     # so a session that never got a turn adds nothing.
@@ -1243,7 +1504,13 @@ def run_once(run: str, create: Callable, audit: Callable | None = None) -> dict:
           # reason, so the stop alone would show nothing at all.
           + (f"  refused={trace['refused_turns']}x"
              f"  why={refusal_category(trace['turns'])}"
-             if trace["refused_turns"] else ""))
+             if trace["refused_turns"] else "")
+          # The refusals that were served anyway. Counted beside the ones that
+          # were not, because the gap between the two is the only thing that
+          # says whether the fallback is working: both arrive as HTTP 200 and
+          # neither appears in any error count.
+          + (f"  fallback={trace['fallback_turns']}x" if trace["fallback_turns"] else "")
+          + (f"  unpriced={trace['unpriced_turns']}x" if trace["unpriced_turns"] else ""))
     if missing:
         print(f"  {run}: reached for, not in {IMAGE}: {', '.join(missing)}", file=sys.stderr)
     if trace["error"]:
@@ -1398,12 +1665,12 @@ def fork(parent: str, index: int, new: str) -> int:
 def stalled(meter: dict) -> bool:
     """Whether the run has refused its last REFUSAL_STREAK sessions running.
 
-    A session stops for refusal only once REFUSAL_TURNS of them run together, so
-    what this counts is runs whose wakes cannot get past the refusal at all: the
+    What this counts is runs whose wakes cannot get past the refusal at all: the
     next wake opens on a near-identical context and meets the same wall, and the
-    run cannot break out of it by acting because it never gets to act. A session
-    that was refused and carried on stops for its own reason and breaks the
-    streak, which is the distinction the per-turn notice buys.
+    run cannot break out of it by acting because it never gets to act. A refusal
+    that reaches here has already been declined by every model the fallback
+    chain offered, so a streak of them is a run the classifier will not let
+    start rather than a run having a bad session.
 
     Eight is a runaway guard, deliberately not a productivity filter. In the
     cohort that produced it, one healthy run refused three sessions running and
@@ -1464,7 +1731,40 @@ def start(config: Path | None = None) -> Callable:
         refuse(f"ANTHROPIC_BASE_URL is set ({url!r}); unset it first.")
 
     import anthropic
-    return anthropic.Anthropic(max_retries=0).messages.create
+    client = anthropic.Anthropic(max_retries=0)
+    for line in unpriced_targets(client, MODEL):
+        refuse(line)
+    return client.beta.messages.create
+
+
+def unpriced_targets(client: Any, model: str) -> list[str]:
+    """Reasons a fallback could serve a turn this run cannot cost. Empty is fine.
+
+    The models `model` is permitted to fall back to are published as
+    allowed_fallback_models once the beta is on. That list governs the form of
+    the parameter that names its own models; the default routing this harness
+    sends chooses from a table that is not published anywhere. So the list is a
+    likely superset of what can actually serve a turn, which makes it worth
+    pricing against before a run starts and not worth trusting as the whole
+    guard - measure_response() is what holds when a model outside it arrives.
+
+    A list that cannot be read is not a reason to refuse a run that would
+    otherwise be fine, so anything short of a priced model missing from PRICES
+    is a warning and nothing more.
+    """
+    try:
+        entry = client.beta.models.retrieve(model, betas=[FALLBACK_BETA])
+        targets = list(getattr(entry, "allowed_fallback_models", None) or [])
+    except Exception as e:                     # noqa: BLE001 - see docstring
+        print(f"could not read {model}'s fallback targets ({type(e).__name__}: {e}); "
+              f"a fallback to a model with no rates will be costed at the dearest in PRICES.",
+              file=sys.stderr)
+        return []
+    if unpriced := [m for m in targets if m not in PRICES]:
+        return [f"{model} may fall back to {', '.join(unpriced)}, which have no rates. "
+                f"Add them to PRICES in wake.py, or every number this run writes to "
+                f"meter.json and to n is costed wrong."]
+    return []
 
 
 def drive(run: str, create: Callable, prepare: Callable | None = None,

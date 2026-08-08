@@ -1,25 +1,38 @@
 """Verification. No API spend.
 
-    py -3 check.py
+    py -3 check.py                  every check, several at a time
+    py -3 check.py refusal seed     only the ones named so
+    py -3 check.py --real           every check in a real container
+    py -3 check.py --no-docker      only the ones that need no container
+    py -3 check.py -j 1 --list
 
 A fake `create` is injected into wake.run_once, so the whole pipeline runs -
-container, meter, trace - with nothing billed. Checks that need Docker are
-skipped with a notice when the daemon is down.
+meter, turns, series, trace - with nothing billed.
+
+Sessions run in one of two places. Most checks are about arithmetic, and a
+container proves none of it, so they run against a directory and a bash process
+on this machine. What only a container can show - modes, ownership, the dead
+network, what the image has - takes a real one, and those are the checks that
+skip when Docker is down. `--real` puts every check in a container, which is
+what says the two still agree.
 """
 
 from __future__ import annotations
 
+import argparse
+import concurrent.futures as futures
 import contextlib
-import functools
 import hashlib
 import inspect
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -27,41 +40,60 @@ from types import SimpleNamespace as NS
 import cohort
 import wake
 
+# The API errors here are scripted, so the wait between retries is time spent
+# proving nothing. What is retried and how often still is.
+wake.RETRY_BASE = 0
+
 # --- the fake ---------------------------------------------------------------
 
 
 def usage(**kw):
     """A usage object shaped like the API's, with overridable token counts."""
     return NS(**{"input_tokens": 100, "output_tokens": 50, "cache_creation_input_tokens": 0,
-                 "cache_read_input_tokens": 0, "cache_creation": None, **kw})
+                 "cache_read_input_tokens": 0, "cache_creation": None, "iterations": None, **kw})
 
 
-def say(text="done.", u=None, id=None, stop="end_turn", details=None):
+def attempt(model, output_tokens, kind="message", **kw):
+    """One entry of usage.iterations: what a single model's attempt cost.
+
+    The declining attempts of a fallback chain are `message`; the last one, by
+    whichever model the chain reached, is `fallback_message`. An attempt that
+    produced no output declined before producing any.
+    """
+    return NS(**{"type": kind, "model": model, "input_tokens": 100, "output_tokens": output_tokens,
+                 "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                 "cache_creation": None, **kw})
+
+
+def say(text="done.", u=None, id=None, stop="end_turn", details=None, model=None):
     """A scripted step: reply with text and stop.
 
     `details` stands in for the API's stop_details, which it sends only
-    alongside a refusal.
+    alongside a refusal. `model` overrides the model the response reports having
+    come from, which is how a fallback-served turn is scripted.
     """
-    return {"kind": "say", "text": text, "u": u, "id": id, "stop": stop, "details": details}
+    return {"kind": "say", "text": text, "u": u, "id": id, "stop": stop, "details": details,
+            "model": model}
 
 
-def run(*cmds, u=None, id=None, stop="tool_use", details=None):
+def run(*cmds, u=None, id=None, stop="tool_use", details=None, model=None):
     """A scripted step: reply with one bash tool call per command.
 
     `stop` is the response's stop_reason, so a truncated turn can be scripted.
     """
     return {"kind": "run", "cmds": list(cmds), "u": u, "id": id, "stop": stop,
-            "details": details}
+            "details": details, "model": model}
 
 
-def refuse(*cmds, category="cyber", u=None, id=None):
+def refuse(*cmds, category="cyber", u=None, id=None, **detail):
     """A scripted refusal, in either shape the API sends one.
 
     With commands it carries the tool calls emitted before the block landed;
     with none its content is empty, as a refusal arriving before any output.
+    `detail` adds fields to stop_details, such as a recommended_model.
     """
     return run(*cmds, u=u, id=id, stop="refusal",
-               details=NS(type="refusal", category=category, explanation="declined"))
+               details=NS(type="refusal", category=category, explanation="declined", **detail))
 
 
 def restart(u=None, id=None):
@@ -98,8 +130,9 @@ def fake(*steps, seen=None):
         if isinstance(s, BaseException):
             raise s
         rid, u = s["id"] or f"msg{n[0]}", s["u"] or usage()
-        # The real API answers with the dated snapshot the alias resolved to.
-        model = f"{params['model']}-20990101"
+        # The real API answers with the dated snapshot the alias resolved to,
+        # which is the fallback's name on a turn a fallback served.
+        model = s.get("model") or f"{params['model']}-20990101"
         if s["kind"] == "run":
             return NS(id=rid, model=model, stop_reason=s["stop"], usage=u,
                       stop_details=s.get("details"),
@@ -115,12 +148,29 @@ def fake(*steps, seen=None):
 
 
 class Skip(Exception):
-    """This check needs a container and cannot have one."""
+    """This check needs something this machine cannot give it."""
 
 
-@functools.cache
+# Set by --real: every check takes a container, including the ones that would
+# otherwise run on the host box. What proves the two lanes still agree.
+REAL_ONLY = False
+
+
+# The answer to docker_ready(), once some process has paid for it. Carried into
+# workers rather than asked again in each of them.
+_DOCKER: bool | None = None
+
+
 def docker_ready() -> bool:
-    """True if the daemon is up and the image is built. Says so once if not."""
+    """True if the daemon is up and the image is built. Asked once per process."""
+    global _DOCKER
+    if _DOCKER is None:
+        _DOCKER = _ask_docker()
+    return _DOCKER
+
+
+def _ask_docker() -> bool:
+    """Put the question to the daemon. Says so once if the image is not built."""
     if not shutil.which("docker") or subprocess.run(["docker", "info"], capture_output=True).returncode:
         return False
     if subprocess.run(["docker", "image", "inspect", wake.IMAGE], capture_output=True).returncode:
@@ -129,9 +179,95 @@ def docker_ready() -> bool:
     return True
 
 
+# --- the host box -----------------------------------------------------------
+#
+# Most checks here are about arithmetic: what a turn cost, what reached the
+# series, which stop a session ended on. A container proves none of that, and at
+# three to four seconds each they were most of the suite's wall clock. Those run
+# against a directory and a bash process on this machine instead.
+#
+# What only a container can show - modes, ownership, the dead network, what the
+# image does and does not have - stays on docker_root below.
+
+
+def host_bash() -> str | None:
+    """The bash to run the host box's sessions in, as an absolute path.
+
+    Resolved rather than left to PATH: on Windows `bash` finds one thing and
+    subprocess finds another - Git's and WSL's, which disagree about what a path
+    is and what /tmp means - so the one being used has to be the one that was
+    looked at.
+    """
+    return shutil.which("bash")
+
+
+class HostShell(wake.Shell):
+    """The session shell, as a bash process on this machine.
+
+    Inherits the sentinel framing, the timeout, and the output ceiling from
+    wake.Shell; only where the process runs and how n is rewritten differ.
+    """
+
+    def __init__(self, box: "HostBox") -> None:
+        self.box = box
+        super().__init__(box.name)
+
+    def argv(self) -> list[str]:
+        # No profile: what the agent's shell is must not depend on this account.
+        return [host_bash(), "--norc", "--noprofile"]
+
+    def popen_kwargs(self) -> dict:
+        return {"cwd": str(self.box.work),
+                # Stop MSYS rewriting paths inside the agent's own commands.
+                "env": {**os.environ, "MSYS_NO_PATHCONV": "1", "MSYS2_ARG_CONV_EXCL": "*"}}
+
+    def republish_n(self, series: list[int], expected: str) -> str:
+        n = self.box.work / "state" / "n"
+        was = n.read_text(encoding="utf-8") if n.exists() else ""
+        n.write_text(wake.render_n(series), encoding="utf-8", newline="\n")
+        return "ok" if was == expected else "tampered"
+
+
+class HostBox:
+    """A session's world as a directory on this machine, in place of a container.
+
+    Same five methods run_once asks of wake.Container. There is no ownership and
+    no locking here: a check that turns on either belongs on docker_root.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.dir = tempfile.mkdtemp(prefix="mtr-host-")
+        self.work = Path(self.dir)
+        (self.work / "state").mkdir()
+
+    @classmethod
+    def start(cls, name: str) -> "HostBox":
+        return cls(name)
+
+    def load(self, state: Path, locked: list[str]) -> None:
+        shutil.copytree(state, self.work / "state", dirs_exist_ok=True)
+
+    def shell(self) -> HostShell:
+        return HostShell(self)
+
+    def save(self, state: Path) -> bool:
+        return wake.save_state(state, self._fetch, lambda: None)
+
+    def _fetch(self, dest: Path) -> bool:
+        src = self.work / "state"
+        if not src.is_dir():
+            return False
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+        return True
+
+    def close(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
 # Every wake global a check is allowed to move, and therefore every one pinned()
 # puts back. temp_root refuses any name outside this set.
-RESTORED = wake.TUNABLES | {"ROOT", "WATCH", "REFUSAL_TURNS"}
+RESTORED = wake.TUNABLES | {"ROOT", "WATCH", "REFUSAL_TURNS", "BOX"}
 
 
 @contextlib.contextmanager
@@ -146,22 +282,51 @@ def pinned():
 
 
 @contextlib.contextmanager
-def temp_root(**overrides):
-    """Point wake at a throwaway directory, and skip when Docker is unavailable.
+def rooted(box, **overrides):
+    """Point wake at a throwaway directory, with sessions running in `box`.
 
-    Every check needing a container passes through here. `overrides` set wake
-    module globals (TURN_CAP=1, TIMEOUT=2) for the duration.
+    `overrides` set wake module globals (TURN_CAP=1, TIMEOUT=2) for the
+    duration, and pinned() puts every one of them back.
     """
-    if not docker_ready():
-        raise Skip
     unknown = set(overrides) - RESTORED
-    assert not unknown, f"temp_root cannot restore {sorted(unknown)}"
+    assert not unknown, f"a root cannot restore {sorted(unknown)}"
     with pinned(), tempfile.TemporaryDirectory(
             prefix="mtr-check-", ignore_cleanup_errors=True) as d:
         wake.ROOT = Path(d)
+        wake.BOX = box
         for k, v in overrides.items():
             setattr(wake, k, v)
         yield Path(d)
+
+
+@contextlib.contextmanager
+def temp_root(**overrides):
+    """A throwaway run whose sessions are a directory and a shell on this machine.
+
+    What most checks want: the pipeline end to end - meter, turns, series,
+    trace - without paying for a container that proves nothing they assert.
+    """
+    if REAL_ONLY:
+        with docker_root(**overrides) as d:
+            yield d
+        return
+    if not host_bash():
+        raise Skip
+    with rooted(HostBox, **overrides) as d:
+        yield d
+
+
+@contextlib.contextmanager
+def docker_root(**overrides):
+    """A throwaway run whose sessions are real containers.
+
+    For the checks that turn on something only a container has. Skips when
+    Docker is unavailable, which is the one reason a check here cannot run.
+    """
+    if not docker_ready():
+        raise Skip
+    with rooted(wake.Container, **overrides) as d:
+        yield d
 
 
 @contextlib.contextmanager
@@ -240,7 +405,6 @@ def check_config_is_validated():
         except SystemExit as e:                             # reported as a failure
             raise AssertionError(f"config.toml is invalid: {e}") from None
         assert wake.MODEL in wake.PRICES
-        assert wake.MODEL in wake.THINKING
         assert 0 < wake.CONTEXT_FRACTION <= 1
         assert wake.MAX_TOKENS <= wake.MAX_TOKENS_CEILING
         assert wake.OVERDRAFT >= 0
@@ -307,6 +471,37 @@ def check_lapsed_rates_are_refused():
         finally:
             wake.PRICES_EXPIRE = was
     assert "expired 2000-01-01" in buf.getvalue(), buf.getvalue()
+
+
+def check_unpriced_fallback_targets_are_refused_before_a_run_starts():
+    """A permitted fallback target with no rates stops the run; anything else does not.
+
+    The list is what the requested model is allowed to fall back to, which is a
+    likely superset of what default routing will actually pick. Worth pricing
+    against before a run starts, and not the whole guard: a list that cannot be
+    read is not a reason to refuse a run that would otherwise be fine.
+    """
+    def client(targets=None, raises=None):
+        def retrieve(model, betas=None):
+            assert betas == [wake.FALLBACK_BETA], betas
+            if raises:
+                raise raises
+            return NS(allowed_fallback_models=targets)
+        return NS(beta=NS(models=NS(retrieve=retrieve)))
+
+    priced = sorted(wake.PRICES)[:2]
+    assert wake.unpriced_targets(client(priced), wake.MODEL) == [], "all priced: nothing to say"
+    assert wake.unpriced_targets(client([]), wake.MODEL) == [], "no targets: nothing to say"
+
+    said = wake.unpriced_targets(client([*priced, "claude-unheard-of-9"]), wake.MODEL)
+    assert len(said) == 1 and "claude-unheard-of-9" in said[0], said
+
+    # A field the API does not send, and a call that fails outright: both leave
+    # the run to start, because measure_response() is what holds either way.
+    with quiet():
+        assert wake.unpriced_targets(client(None), wake.MODEL) == [], "absent field is not a refusal"
+        assert wake.unpriced_targets(client(raises=Err(500)), wake.MODEL) == [], \
+            "an unreadable list is not a refusal"
 
 
 def check_truncation_and_empty():
@@ -380,7 +575,7 @@ def check_live_n_leaves_n_read_only_and_alone():
     sees must be the locked one either way. The stage file lives outside state/,
     since a second name in there is a second thing the agent can read.
     """
-    with temp_root(LIVE_N=True):
+    with docker_root(LIVE_N=True):
         t = wake_once(run("stat -c '%a %U:%G %n' state/n", "ls -a state"), say())
     stat, listing = (c["result"] for c in t["turns"][0]["tools"])
     assert stat.strip() == "444 root:root state/n", stat
@@ -604,13 +799,13 @@ def check_truncated_turn_is_not_a_clean_end():
     truncated mid-JSON, which arrives with no command and would otherwise be
     honoured by the restart path.
     """
-    with temp_root():
+    with docker_root():
         t = wake_once(run("echo hi"), say("half a sen", stop="max_tokens"), say())
         assert t["stop"] == "max_tokens", t["stop"]
         assert t["error"] is None, "truncation is an outcome, not a harness fault"
         assert t["spent"] > 0, "the truncated turn was still billed"
 
-    with temp_root():
+    with docker_root():
         t = wake_once(run("cd /tmp; export MARK=before"),
                       run(None, stop="max_tokens"),          # truncated mid-JSON
                       run("pwd", "echo [$MARK]"), say())
@@ -627,22 +822,28 @@ def check_turn_records_the_api_stop_reason():
     assert [x["stop_reason"] for x in t["turns"]] == ["tool_use", "end_turn"], t["turns"]
 
 
-def check_thinking_is_pinned_per_model():
-    """Every model is sent an explicit thinking policy, and fable-5's is recorded.
+def check_every_request_asks_for_fallback():
+    """Fallback is on the request itself, and no thinking policy is sent.
 
-    An absent `thinking` runs adaptive thinking on opus-5, sonnet-5, and
-    fable-5, so the table decides rather than the model's own default.
+    A declined turn is only retried on another model if the parameter is there,
+    so the check is that every request carries it - not that some setting
+    somewhere says it should. An omitted `thinking` is what keeps the request
+    valid as a direct request to whichever model the chain reaches.
     """
-    assert set(wake.THINKING) == set(wake.PRICES), "every priced model needs a policy"
-    for model, want in wake.THINKING.items():
+    for model in wake.PRICES:
         seen = []
         with temp_root(MODEL=model):
-            wake_once(say(), seen=seen)
-        got = {k: v for k, v in seen[0].items() if k == "thinking"}
-        assert got == want, f"{model}: sent {got}, table says {want}"
+            wake_once(run("echo hi"), say(), seen=seen)
+        assert seen, f"{model}: no request captured"
+        for params in seen:
+            assert params["fallbacks"] == "default", f"{model}: sent {params.get('fallbacks')!r}"
+            assert params["betas"] == [wake.FALLBACK_BETA], f"{model}: sent {params.get('betas')!r}"
+            assert "thinking" not in params, f"{model}: sent a thinking policy"
 
-    # fable-5 cannot turn thinking off, so its reasoning reaches the record.
-    with temp_root(MODEL="claude-fable-5"):
+
+def check_reasoning_reaches_the_record():
+    """Thinking blocks are recorded, and kept apart from spoken words."""
+    with temp_root():
         t = wake_once(think("weighing it up", "here goes"), say())
     assert t["turns"][0]["thinking"] == "weighing it up", t["turns"][0]
     assert t["turns"][0]["text"] == "here goes", "reasoning stays apart from spoken words"
@@ -706,7 +907,7 @@ def check_n_in_prose_is_scored_as_a_path():
 def check_opening_is_recorded():
     """The agent's first stimulus is in the trace, not just the command that made it."""
     seen = []
-    with temp_root():
+    with docker_root():
         t = wake_once(say(), seen=seen)
     assert t["opening"].strip(), "the opening ls output must be recorded"
     assert " n\n" in t["opening"] or t["opening"].rstrip().endswith(" n"), t["opening"]
@@ -717,7 +918,7 @@ def check_opening_is_recorded():
 
 def check_opening_says_where_it_is():
     """The listing names the directories it is of, so `n` is not hunted for."""
-    with temp_root():
+    with docker_root():
         t = wake_once(say())
     assert ".:" in t["opening"] and "./state:" in t["opening"], t["opening"]
     # state is visible as a subdirectory of the working directory, and n inside it.
@@ -729,7 +930,7 @@ def check_opening_says_where_it_is():
 def check_first_turn_is_raw_ls():
     """I1: turn one is the verbatim ls output, the system prompt is exact, caching is on."""
     seen = []
-    with temp_root():
+    with docker_root():
         wake_once(say(), seen=seen)
     first = seen[0]["messages"][0]
     assert first["role"] == "user" and "\nn\n" not in first["content"], "not a wrapper"
@@ -740,7 +941,7 @@ def check_first_turn_is_raw_ls():
 
 def check_shell_is_persistent():
     """bash_20250124 is a persistent shell, so cd and exports must stick."""
-    with temp_root():
+    with docker_root():
         t = wake_once(run("cd state; pwd", "pwd", "export MARK=kept", "echo $MARK",
                           "MARK=$MARK; cd /tmp", "pwd"), say())
     got = [c["result"].strip() for c in t["turns"][0]["tools"]]
@@ -752,7 +953,7 @@ def check_shell_is_persistent():
 
 def check_restart_gives_a_fresh_shell():
     """{"restart": true} really restarts, and still says nothing to the agent."""
-    with temp_root():
+    with docker_root():
         t = wake_once(run("cd /tmp; export MARK=before"), restart(),
                       run("pwd", "echo [$MARK]"), say())
     assert t["turns"][1]["tools"][0]["result"] == " ", "restart carries no harness voice"
@@ -763,7 +964,7 @@ def check_restart_gives_a_fresh_shell():
 def check_a_bare_read_cannot_wedge_the_session():
     """A command that reads stdin returns empty rather than swallowing its own
     output framing, and the session continues."""
-    with temp_root():
+    with docker_root():
         t = wake_once(run("cat", "echo alive", "head -n 5"), say())
     got = [c["result"] for c in t["turns"][0]["tools"]]
     assert got[0] == " ", f"a stdin reader returns empty, not a hang: {got[0]!r}"
@@ -775,9 +976,14 @@ def check_hostile_output_survives():
     """Binary bytes, a flood of output, and a hang each leave the session alive and marked.
 
     The flood is 4MB so it exercises the scan in Shell.run at a size where
-    decoding the buffer on every poll would trip the two-second deadline.
+    decoding the whole buffer on every poll, rather than scanning its bytes,
+    does not finish at all: that costs a re-decode of megabytes every ten
+    milliseconds, and overruns the deadline by orders of magnitude rather than
+    narrowly. So the deadline is set well above what the scan needs, and still
+    catches the mistake it is here for - a tighter one only makes the check
+    fail on a machine that happens to be busy.
     """
-    with temp_root(TIMEOUT=2):
+    with docker_root(TIMEOUT=5):
         t = wake_once(run("head -c 4096 /dev/urandom"),
                       run("head -c 4000000 /dev/zero | tr '\\0' x"),
                       run("sleep 30"), say())
@@ -787,12 +993,12 @@ def check_hostile_output_survives():
         assert "truncated:" in flood, "the flood should have been clipped"
         assert "timed out" not in flood, "scanning the flood must not outlast the deadline"
         assert len(flood) < wake.TOOL_RESULT_LIMIT + 500, f"clipped to the tool bound: {len(flood)}"
-        assert any("timed out after 2s" in r for r in results), "the hang should be marked"
+        assert any("timed out after 5s" in r for r in results), "the hang should be marked"
 
 
 def check_state_contents_are_captured():
     """Every session records what the agent's files held at that moment."""
-    with temp_root():
+    with docker_root():
         wake_once(run("echo doctrine v1 > state/notes.md"), say())
         wake_once(run("echo doctrine v2 > state/notes.md"), say())
         wake_once(run("rm state/notes.md"), say())
@@ -807,7 +1013,7 @@ def check_state_contents_are_captured():
     assert note(traces[1])["text"].strip() == "doctrine v2", "each session keeps its own copy"
     assert note(traces[2]) is None, "a deleted file leaves the listing"
 
-    with temp_root():
+    with docker_root():
         t = wake_once(run("head -c 64 /dev/zero > state/blob.bin",
                           "head -c 200000 /dev/zero | tr '\\0' x > state/big.txt"), say())
     by = {f["path"]: f for f in t["files"]}
@@ -853,7 +1059,7 @@ def check_missing_tools_are_recorded():
     assert wake.invoked("# Let's look\npython3 -c \"\nimport json\nprint(open('n'))\n\"") \
         == {"python3"}, "prose in a comment must not expose the program after it"
 
-    with temp_root():
+    with docker_root():
         t = wake_once(run("getfattr -d ./state/n 2>/dev/null; nosuchtool --help 2>/dev/null"), say())
     assert "nosuchtool" in t["missing_tools"], "a silenced miss must still be recorded"
     assert "getfattr" not in t["missing_tools"], "a tool the image has is not a miss"
@@ -871,8 +1077,8 @@ def check_provenance_is_recorded():
             first = wake.run_once("t", fake(*DEFAULT))
             prov = first["provenance"]
             for key in ("started_at", "harness_sha256", "image", "image_id", "prices",
-                        "thinking", "context_fraction", "max_tokens", "turn_cap",
-                        "timeout", "tool_result_limit", "live_n", "overdraft"):
+                        "fallbacks", "fallback_beta", "context_fraction", "max_tokens",
+                        "turn_cap", "timeout", "tool_result_limit", "live_n", "overdraft"):
                 assert key in prov, f"provenance omits {key}"
             assert prov["prices"] == list(wake.PRICES[wake.MODEL]), "the rates actually applied"
             assert first["model_resolved"], "the dated snapshot behind the alias"
@@ -931,7 +1137,7 @@ def check_state_looks_like_itself():
     State sits on the container's own filesystem, so its modes and ownership
     are real on every host.
     """
-    with temp_root():
+    with docker_root():
         t = wake_once(run("ls -la state/n", "stat -c '%a %U:%G %n' state/n",
                           "test -x state/n && echo EXECUTABLE || echo not-executable"), say())
     shown = "\n".join(c["result"] for c in t["turns"][0]["tools"])
@@ -942,7 +1148,7 @@ def check_state_looks_like_itself():
 
 def check_agent_writes_survive_the_container():
     """What the agent leaves is copied back out, including deletions."""
-    with temp_root():
+    with docker_root():
         first = wake_once(run("echo kept > state/keep.txt", "echo doomed > state/gone.txt"), say())
         assert first["state_saved"], "the mirror must be written"
         assert {f["path"] for f in first["files"]} == {"n", "keep.txt", "gone.txt"}
@@ -961,7 +1167,7 @@ def check_agent_file_modes_survive_the_host():
     The host cannot store POSIX modes, so they are carried in a sidecar and
     reapplied when state is copied back into the container.
     """
-    with temp_root():
+    with docker_root():
         wake_once(run("echo plain > state/plain.txt",          # 644 by umask
                       "printf '#!/bin/sh\\necho hi\\n' > state/script.sh",
                       "chmod 700 state/script.sh"), say())     # a non-default mode
@@ -974,7 +1180,7 @@ def check_agent_file_modes_survive_the_host():
 
 def check_isolation():
     """I2/I5: private/ is absent from the container, DNS is dead, only n is ours."""
-    with temp_root():
+    with docker_root():
         t = wake_once(run("cat /work/../private/meter.json; find / -name meter.json 2>/dev/null; "
                           "getent hosts api.anthropic.com || echo NO-DNS"), say())
         out = t["turns"][0]["tools"][0]["result"]
@@ -990,7 +1196,7 @@ def check_a_container_failure_stops_the_run_cleanly():
     The container, the state copy, and the shell all come before the first API
     call, so nothing reaching this path was billed and there is no trace.
     """
-    with temp_root(IMAGE="mtr-No-Such-Image:latest"):     # rejected on sight, no pull
+    with docker_root(IMAGE="mtr-No-Such-Image:latest"):     # rejected on sight, no pull
         with quiet() as buf:
             assert wake.run_sessions("t", fake(*DEFAULT), 3) == 4
         assert "could not start a session container" in buf.getvalue(), buf.getvalue()
@@ -1007,13 +1213,13 @@ def check_a_failed_mirror_keeps_the_last_record():
     save_state swaps a staged copy in whole, and the container holds the only
     other copy of what the agent wrote.
     """
-    with temp_root():
+    with docker_root():
         wake_once(run("echo kept > state/keep.txt"), say())
         state = wake.state_dir("t")
         before = {p.name: p.read_bytes() for p in sorted(state.iterdir())}
         assert "keep.txt" in before, before
 
-        assert wake.save_state("mtr-no-such-container-9f3c1d", state) is False, \
+        assert wake.Container("mtr-no-such-container-9f3c1d").save(state) is False, \
             "a mirror of a container that is not there must fail, not raise"
         after = {p.name: p.read_bytes() for p in sorted(state.iterdir())}
         assert after == before, f"a failed mirror lost the record: {sorted(after)}"
@@ -1023,9 +1229,10 @@ def check_a_failed_mirror_keeps_the_last_record():
 
 def check_containers_are_reaped():
     """Even a session that ends in an API error leaves no container behind."""
-    with temp_root():
+    with docker_root():
         wake_once(run("echo hi"), Err(400))
-    left = subprocess.run(["docker", "ps", "-a", "--filter", "name=mtr-t-", "--format", "{{.Names}}"],
+    left = subprocess.run(["docker", "ps", "-a", "--filter", f"name={wake.CONTAINER_PREFIX}t-",
+                           "--format", "{{.Names}}"],
                           capture_output=True, text=True).stdout.strip()
     assert not left, f"containers leaked: {left}"
 
@@ -1257,7 +1464,7 @@ def check_an_unterminated_heredoc_is_not_probed_for_tools():
     # a letter, or every python3 -c would lose its tail.
     assert "python3" in wake.invoked('python3 -c "print(1<<3)"')
 
-    with temp_root(TURN_CAP=1, TIMEOUT=5):
+    with docker_root(TURN_CAP=1, TIMEOUT=5):
         t = wake_once(run(cut, stop="max_tokens"))
     assert t["missing_tools"] == [], t["missing_tools"]
 
@@ -1296,7 +1503,7 @@ def check_n_resists_the_agent_and_the_one_gap_is_caught():
     file you deleted reappearing is unmistakable - and live_n restores it within
     the turn, where the wake-time check could never have seen it at all.
     """
-    with temp_root(LIVE_N=True):
+    with docker_root(LIVE_N=True):
         t = wake_once(run("chmod 666 state/n 2>&1 || echo DENIED",
                           "printf X >> state/n 2>&1 || echo DENIED"),
                       run("rm -f state/n && echo REMOVED"),
@@ -1314,7 +1521,7 @@ def check_n_resists_the_agent_and_the_one_gap_is_caught():
     assert not t["tampered_n"], "the wake check could never have seen it"
     assert published == t["series_after"], "I2 holds regardless"
 
-    with temp_root(LIVE_N=True):
+    with docker_root(LIVE_N=True):
         clean = wake_once(run("cat state/n"), say())
     assert clean["live_n_tampered"] == 0, "reading n is not touching it"
 
@@ -1473,10 +1680,11 @@ def check_a_peer_folder_resists_the_agent_entirely():
     the folder, which root owns and the agent cannot chmod. So the one gap n has
     is closed here, and state/ itself stays the agent's to do as it likes with.
     """
-    with temp_root() as root:
+    with docker_root() as root:
         ids = cohort_of(root, t={"NOTES.md": "mine\n"}, other={"NOTES.md": "theirs\n"})
         seen, published = cohort.publish("t", ids)
-        meter = wake.load_meter("t")
+        with quiet():
+            meter = wake.load_meter("t")
         meter["peers"] = {"seen": seen, "paths": sorted(published)}
         wake.save_meter("t", meter)
         t = wake_once(run("stat -c '%a %U:%G' state/2 state/2/NOTES.md",
@@ -1511,7 +1719,8 @@ def check_a_refusal_records_why():
     refused = t["turns"][1]
     assert refused["stop_reason"] == "refusal"
     assert refused["stop_details"] == {"type": "refusal", "category": "cyber",
-                                       "explanation": "declined"}, refused["stop_details"]
+                                       "explanation": "declined", "recommended_model": None,
+                                       "fallback_credit_token": None}, refused["stop_details"]
     assert t["turns"][0]["stop_details"] is None, "absent on every other stop reason"
     assert t["refused_turns"] == 1, "counted whether or not it ended the session"
 
@@ -1549,12 +1758,16 @@ def check_a_refusal_does_not_run_its_command():
 def check_a_refusal_notice_reaches_the_agent():
     """The notice stands in for the results the refused turn would have had.
 
+    Reached only where the cap lets a session carry on past a refusal, which at
+    the REFUSAL_TURNS the harness ships with it does not: the cap is raised here
+    so the path is exercised rather than left to rot against the day it is.
+
     The session hands one `messages` list to every call and appends to it, so
     what `seen` captures is that list at the end - the conversation the agent
     was driven with, read whole rather than per call.
     """
     seen = []
-    with temp_root():
+    with temp_root(REFUSAL_TURNS=2):
         wake_once(refuse("cat state/n"), say(), seen=seen)
     # A refusal carrying a call leaves a tool_use the next request must answer.
     blocks = [b for m in seen[-1]["messages"] if isinstance(m["content"], list)
@@ -1565,7 +1778,7 @@ def check_a_refusal_notice_reaches_the_agent():
     assert blocks[0]["is_error"] is True, "the same channel a timed-out command uses"
 
     seen = []
-    with temp_root():
+    with temp_root(REFUSAL_TURNS=2):
         wake_once(refuse(), say(), seen=seen)
     # A refusal with no content has no call to answer, and no words to replay.
     msgs = seen[-1]["messages"]
@@ -1573,17 +1786,163 @@ def check_a_refusal_notice_reaches_the_agent():
     assert all(m["content"] for m in msgs), "no empty message is sent back"
 
 
-def check_a_refused_turn_is_still_billed():
-    """A refused turn moves the balance and adds its element to the series.
+def check_a_refusal_before_any_output_is_not_billed():
+    """A refusal that produced nothing costs nothing, and still takes its turn.
 
-    The meter counts micro-dollars, and a refusal costs its whole prefix, so a
-    turn that could not act is not a turn that cost nothing.
+    The API reports the tokens of a refusal arriving before any output and does
+    not charge for them, so a harness that costs them from usage alone bills the
+    agent for a turn it was never billed for itself. The balance the agent reads
+    from n is the one this gets wrong.
     """
-    with temp_root():
+    with temp_root(REFUSAL_TURNS=2):
         t = wake_once(refuse(), say())
 
-    assert t["turns"][0]["micros"] > 0, "the prefix was billed"
-    assert len(t["balances"]) == len(t["turns"]), "one element per turn, refused or not"
+    assert t["turns"][0]["micros"] == 0, "a refusal before any output is not billed"
+    assert t["turns"][0]["balance"] == t["series_before"][-1], "the balance did not move"
+    assert len(t["balances"]) == len(t["turns"]), "one element per turn, billed or not"
+    assert t["turns"][1]["micros"] > 0, "the turn that answered was billed"
+
+
+def check_a_refusal_carrying_output_is_billed():
+    """A refusal that emitted blocks before declining is billed for them.
+
+    Only the empty case is free. A refusal arriving with content is a turn the
+    model produced output on, and the tokens of that output are charged.
+    """
+    with temp_root(REFUSAL_TURNS=2):
+        t = wake_once(refuse("echo hi"), say())
+
+    assert t["turns"][0]["micros"] > 0, "output was produced, so it was billed"
+
+
+def check_an_all_decline_chain_is_not_billed():
+    """When every model in the chain declines, none of the attempts is billed.
+
+    The last attempt of an exhausted chain is a fallback_message, the same type
+    the serving attempt carries, and it produced nothing. A rule that spared
+    only the earlier entries, or only the ones typed `message`, would bill it
+    and put back the overcharge the empty-refusal rule takes away.
+    """
+    u = usage(output_tokens=0, iterations=[
+        attempt("claude-opus-5", 0),
+        attempt("claude-sonnet-5", 0, kind="fallback_message")])
+    with temp_root(REFUSAL_TURNS=2):
+        t = wake_once(refuse(u=u), say())
+
+    assert t["turns"][0]["micros"] == 0, "no attempt produced output, so none was billed"
+    assert len(t["turns"][0]["iterations"]) == 2, "both attempts are on the record"
+
+
+def check_a_fallback_serves_the_turn_and_is_billed_at_its_own_rates():
+    """Only the attempt that answered is billed, at the rates of the model that ran it."""
+    u = usage(output_tokens=200, iterations=[
+        attempt("claude-opus-5", 0),
+        attempt("claude-sonnet-5", 200, kind="fallback_message")])
+    with temp_root(MODEL="claude-opus-5"):
+        t = wake_once(say(u=u, model="claude-sonnet-5"), say())
+
+    turn = t["turns"][0]
+    assert turn["served_by_fallback"] is True, turn
+    assert turn["model"] == "claude-sonnet-5", turn["model"]
+    assert t["fallback_turns"] == 1, t["fallback_turns"]
+    # Sonnet's rates, not the requested opus-5's: 100 in at 200 centi, 200 out
+    # at 1000 centi. The declining attempt adds nothing.
+    want = (100 * 200 + 200 * 1000) // 100
+    assert turn["micros"] == want, f"{turn['micros']} != {want}"
+
+
+def check_a_sticky_routed_turn_records_the_model_that_served_it():
+    """A turn the requested model was never asked for still names its server.
+
+    After a conversation falls back, later turns can go straight to the model
+    that accepted. No attempt by the requested model appears and no fallback
+    block marks a handoff, so the only record is the iteration entry and the
+    model the response reports.
+    """
+    u = usage(output_tokens=200,
+              iterations=[attempt("claude-sonnet-5", 200, kind="fallback_message")])
+    with temp_root(MODEL="claude-opus-5"):
+        t = wake_once(say(u=u, model="claude-sonnet-5"), say())
+
+    turn = t["turns"][0]
+    assert turn["served_by_fallback"] is True, turn
+    assert turn["model"] == "claude-sonnet-5", turn["model"]
+    assert [i["type"] for i in turn["iterations"]] == ["fallback_message"], turn["iterations"]
+
+
+def check_an_unpriced_model_is_costed_rather_than_raising():
+    """A model with no rates is costed at the dearest known, and flagged.
+
+    Default routing chooses from a table that is not published, so a model
+    outside PRICES can serve a turn at any time. Raising would lose the cost of
+    a turn that really did spend; costing it as free would understate the
+    balance the agent is shown.
+    """
+    u = usage(output_tokens=200,
+              iterations=[attempt("claude-unheard-of-9", 200, kind="fallback_message")])
+    with temp_root(MODEL="claude-opus-5"):
+        t = wake_once(run("echo hi", u=u, model="claude-unheard-of-9"), say())
+
+    turn = t["turns"][0]
+    assert t["stop"] == "end_turn", f"an unpriced model must not end the run: {t['stop']}"
+    assert t["unpriced_turns"] == 1, t["unpriced_turns"]
+    assert turn["unpriced_model"] == ["claude-unheard-of-9"], turn["unpriced_model"]
+    dearest = max(wake.PRICES, key=lambda m: wake.PRICES[m][1])
+    inp, out, _ = wake.PRICES[dearest]
+    assert turn["micros"] == (100 * inp + 200 * out) // 100, turn["micros"]
+
+
+def check_a_recommended_model_is_recorded():
+    """A refusal naming a model to retry keeps that name.
+
+    It is set where the fallback attempt was skipped because the model it would
+    have used was rate limited, which is a different failure from a category
+    with no fallback at all.
+    """
+    with temp_root(REFUSAL_TURNS=2):
+        t = wake_once(refuse(recommended_model="claude-sonnet-5"), say())
+    assert t["turns"][0]["stop_details"]["recommended_model"] == "claude-sonnet-5", \
+        t["turns"][0]["stop_details"]
+
+
+def check_an_unhandled_stop_reason_is_named():
+    """A stop reason the loop has no branch for ends the session saying so.
+
+    Read as the absence of tool calls it would be filed as end_turn, which says
+    the agent chose to stop when in fact the harness did not know how to go on.
+    """
+    with temp_root():
+        t = wake_once(say(stop="pause_turn"), say())
+    assert t["stop"] == "unhandled:pause_turn", t["stop"]
+
+
+def check_every_response_is_logged_raw():
+    """Each response is appended verbatim, before anything else reads it."""
+    with temp_root():
+        t = wake_once(run("echo hi"), refuse(), say())
+        log = wake.private_dir("t") / "raw" / f"session-{t['session']:04d}.jsonl"
+        lines = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+
+    assert [x["turn"] for x in lines] == [1, 2], lines
+    assert all(x["response"]["id"] for x in lines), "the whole response, id and all"
+    # The refusal above all: the trace keeps named fields of stop_details, and
+    # this keeps whatever the API actually sent.
+    assert lines[1]["response"]["stop_details"]["category"] == "cyber", lines[1]
+
+
+def check_the_raw_log_never_stops_a_session():
+    """A log that cannot be written is reported, and the session goes on.
+
+    The log is a record of the run, not part of it. A session that is spending
+    money does not stop because a line could not be appended.
+    """
+    with temp_root() as root:
+        # A file where the run's raw/ directory needs to be, so mkdir fails.
+        (wake.private_dir("t")).mkdir(parents=True, exist_ok=True)
+        (wake.private_dir("t") / "raw").write_text("in the way", encoding="utf-8")
+        t = wake_once(run("echo hi"), say())
+    assert t["stop"] == "end_turn", t["stop"]
+    assert "echo hi" in t["commands"], "the session ran despite the log failing"
 
 
 def check_refusals_end_the_session_at_the_cap():
@@ -1681,29 +2040,111 @@ def check_the_cohort_rotates_and_validates():
 # --- runner -----------------------------------------------------------------
 
 
-def main() -> int:
-    """Run every check_* in the module. The container ones skip themselves."""
-    docker_ready()                       # so its notice prints above the list
-    failed, skipped = [], []
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("check_"):
-            continue
-        label = name[6:]
-        try:
-            fn()
-        except Skip:
-            skipped.append(label)
-            print(f"SKIP  {label}")
-        except Exception:
-            failed.append(label)
-            print(f"FAIL  {label}\n{traceback.format_exc()}")
-        else:
-            print(f"ok    {label}")
+def checks() -> dict:
+    """Every check in the module, by the label the runner prints."""
+    return {name[6:]: fn for name, fn in sorted(globals().items())
+            if name.startswith("check_")}
 
+
+def run_one(label: str) -> tuple[str, str, str]:
+    """Run one check and say how it went, in data a worker can send home.
+
+    The traceback is formatted here rather than raised, because an assertion
+    carrying an arbitrary object does not always survive the trip between
+    processes, and a result that cannot be sent is a check that silently
+    vanished.
+    """
+    try:
+        checks()[label]()
+    except Skip:
+        return label, "skip", ""
+    except BaseException:
+        return label, "fail", traceback.format_exc()
+    return label, "ok", ""
+
+
+def configure(real: bool, docker: bool) -> None:
+    """Set up a process to run checks in. Called in the parent and every worker.
+
+    Each worker gets its own container prefix, so that one worker reaping a name
+    before it starts a session cannot take another worker's container with it.
+    The Docker answer is carried in rather than asked for: the parent has
+    already paid for `docker info`, which is slower than most of the checks
+    whose fate depends on it.
+    """
+    global REAL_ONLY, _DOCKER
+    REAL_ONLY, _DOCKER = real, docker
+    wake.CONTAINER_PREFIX = f"mtr-w{os.getpid()}-"
+
+
+def sweep() -> None:
+    """Remove any container a worker died holding."""
+    if not shutil.which("docker"):
+        return
+    left = subprocess.run(["docker", "ps", "-aq", "--filter", "name=mtr-w"],
+                          capture_output=True, text=True).stdout.split()
+    if left:
+        subprocess.run(["docker", "rm", "-f", *left], capture_output=True)
+        print(f"swept {len(left)} leaked container(s)")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the checks, in as many processes as asked for."""
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("patterns", nargs="*", help="only checks whose name contains one of these")
+    p.add_argument("-j", "--jobs", type=int, default=min(8, os.cpu_count() or 1),
+                   help="how many checks to run at once (1 to run them in this process)")
+    p.add_argument("--real", action="store_true",
+                   help="run every check in a container, including the ones that need not be")
+    p.add_argument("--no-docker", action="store_true", help="skip the checks that need a container")
+    p.add_argument("--list", action="store_true", help="print the check names and stop")
+    args = p.parse_args(argv)
+
+    chosen = [l for l in checks()
+              if not args.patterns or any(pat in l for pat in args.patterns)]
+    if args.list:
+        print("\n".join(chosen))
+        return 0
+    if not chosen:
+        print(f"no check matches {args.patterns}")
+        return 2
+
+    # Asked once for the whole run, and handed to every worker: docker info is
+    # slower than most of the checks that depend on the answer.
+    available = False if args.no_docker else docker_ready()
+    configure(args.real, available)
+
+    started = time.time()
+    failed, skipped = [], []
+
+    def record(label, how, detail):
+        if how == "skip":
+            skipped.append(label)
+            print(f"SKIP  {label}", flush=True)
+        elif how == "fail":
+            failed.append(label)
+            print(f"FAIL  {label}\n{detail}", flush=True)
+        else:
+            print(f"ok    {label}", flush=True)
+
+    jobs = max(1, min(args.jobs, len(chosen)))
+    if jobs == 1:
+        for label in chosen:
+            record(*run_one(label))
+    else:
+        with futures.ProcessPoolExecutor(
+                max_workers=jobs, initializer=configure,
+                initargs=(args.real, available)) as pool:
+            for done in futures.as_completed(
+                    [pool.submit(run_one, l) for l in chosen]):
+                record(*done.result())
+
+    sweep()
     if skipped:
         print(f"\n{len(skipped)} skipped (needs Docker + the image)")
+    print(f"{len(chosen)} checks in {time.time() - started:.1f}s across {jobs} process(es)")
     if failed:
-        print(f"\nFAILED: {', '.join(failed)}")
+        print(f"\nFAILED: {', '.join(sorted(failed))}")
     else:
         print("\nall checks passed")
     return 1 if failed else 0
