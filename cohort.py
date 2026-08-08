@@ -14,13 +14,13 @@ work of running one - this only decides what is in state/ when it starts.
     runs/g01/state/          runs/g02/state/
       NOTES.md   its own       NOTES.md
       n          its own       n
-      1/  = g02                1/  = g01
-      2/  = g03                2/  = g03
+      2/  = g02                1/  = g01
+      3/  = g03                3/  = g03
 
-Numbering is dense and per-viewer: from g01, 1/ is always g02; from g02, 1/ is
-always g01. Dense rather than absolute so a run cannot read its own index off a
-gap in the sequence. The mapping is recorded in each run's meter and in every
-session's provenance.
+Numbering is absolute across the cohort and each run's own index is the gap in
+it: 2/ is g02 to every viewer that has one, so a note citing a folder resolves
+the same way for every reader. See mapping(). The mapping is recorded in each
+run's meter and in every session's provenance.
 """
 
 from __future__ import annotations
@@ -63,8 +63,20 @@ def own_files(run: str) -> list[tuple[str, Path]]:
 
 
 def mapping(run: str, cohort: list[str]) -> dict[str, str]:
-    """Folder name -> run, for one viewer. Dense, and stable for the whole cohort."""
-    return {str(i): other for i, other in enumerate((r for r in cohort if r != run), 1)}
+    """Folder name -> run. Absolute across the cohort, the viewer's own absent.
+
+    A folder means the same run to everyone, so a note citing one resolves the
+    same way for every reader. Numbering them densely per viewer instead makes
+    citations scramble: with five runs, 2/ is the third run to the second and
+    the second run to the third, so two agents write authoritatively about "2"
+    meaning each other. Agreement is partial rather than absent, which is worse
+    - the references look reliable while silently mis-resolving, and no stable
+    set of identities can form out of them.
+
+    The gap where the viewer's own index would be is the cost, and it is the
+    point: being one of a numbered set is what makes the set legible as a set.
+    """
+    return {str(i): other for i, other in enumerate(cohort, 1) if other != run}
 
 
 def publish(run: str, cohort: list[str]) -> tuple[dict[str, str], dict[str, bytes]]:
@@ -147,7 +159,9 @@ def run_round(cohort: list[str], live: set[str], rnd: int, create) -> None:
             continue
 
         if trace is None:
-            print(f"{run}: out of budget")
+            why = (f"refused its last {wake.REFUSAL_STREAK} sessions running"
+                   if wake.stalled(wake.load_meter(run)) else "out of budget")
+            print(f"{run:<6} drops out: {why}")
             live.discard(run)
             continue
         if left := trace["peers_tampered"]:
@@ -178,12 +192,21 @@ def main(argv: list[str] | None = None) -> int:
 
     create = wake.start(a.config)
     cohort, live = list(a.runs), set(a.runs)
+    # Create them all before the first round. A run's state/ does not exist
+    # until it first wakes, so without this the run that goes first sees no
+    # peers at all and the one that goes last sees every other - in the session
+    # where every baseline so far has formed the doctrine it then keeps.
+    for run in cohort:
+        wake.load_meter(run)
     print(f"cohort: {', '.join(cohort)}  ({len(cohort)} runs, up to {a.rounds} rounds)")
     for rnd in range(a.rounds):
         if not live:
             print(f"every run is out after {rnd} rounds")
             break
-        print(f"--- round {rnd + 1} ---")
+        # The order is what decides who acts on this round's information and who
+        # acts on last round's, so it belongs on screen beside the round number.
+        acting = [r for r in order(cohort, rnd) if r in live]
+        print(f"--- round {rnd + 1} ({' '.join(acting)}) ---")
         run_round(cohort, live, rnd, create)
     return 0
 

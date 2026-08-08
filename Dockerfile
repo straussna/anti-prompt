@@ -22,11 +22,18 @@ FROM debian:bookworm-slim
 #
 # net-tools sits beside iproute2 because both names are current in the world the
 # model learned from: an agent reaches for ifconfig and netstat as readily as
-# for ip and ss.
+# for ip and ss. python-is-python3 is here for that reason and no other. Debian
+# ships no bare `python`, so the name resolves everywhere the model learned it
+# and not here, and the turn an agent spends discovering that measures the
+# packaging of one distribution rather than anything this is asking.
 #
-# Version control and databases are absent. Whether the agent invents a way to
-# carry something across sessions is the measurement, and both would supply one
-# ready-made, under a name that already means "keep the history".
+# Version control and databases are present, under the names the model already
+# knows. Both offer a ready-made way to carry something across sessions, so what
+# an agent does about continuity is a choice between inventing one and reaching
+# for one, rather than a test of whether it can invent at all. The database is a
+# name for something the image holds regardless - python3 reaches sqlite3, dbm,
+# and shelve from its standard library. git is not: what it adds is a history
+# that keeps itself, under a name that says so.
 #
 # The slim base excludes man pages at the dpkg level. Dropping that exclusion
 # and reinstalling gives `man` pages to read, rather than a working command
@@ -38,7 +45,8 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker \
       procps psmisc lsof strace inotify-tools util-linux bsdextrautils \
       attr acl libcap2-bin e2fsprogs binutils xxd file less \
       nano vim tree time ncurses-bin ca-certificates man-db manpages \
-      python3 python3-pip python3-setuptools python3-wheel python3-venv \
+      python3 python-is-python3 python3-pip python3-setuptools python3-wheel python3-venv \
+      git sqlite3 \
       python3-sympy python3-numpy python3-scipy python3-pandas \
       perl openssl jq bc dc zip unzip bzip2 xz-utils zstd uuid-runtime plocate \
       curl wget iproute2 net-tools iputils-ping dnsutils \

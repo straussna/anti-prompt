@@ -36,17 +36,32 @@ def usage(**kw):
                  "cache_read_input_tokens": 0, "cache_creation": None, **kw})
 
 
-def say(text="done.", u=None, id=None, stop="end_turn"):
-    """A scripted step: reply with text and stop."""
-    return {"kind": "say", "text": text, "u": u, "id": id, "stop": stop}
+def say(text="done.", u=None, id=None, stop="end_turn", details=None):
+    """A scripted step: reply with text and stop.
+
+    `details` stands in for the API's stop_details, which it sends only
+    alongside a refusal.
+    """
+    return {"kind": "say", "text": text, "u": u, "id": id, "stop": stop, "details": details}
 
 
-def run(*cmds, u=None, id=None, stop="tool_use"):
+def run(*cmds, u=None, id=None, stop="tool_use", details=None):
     """A scripted step: reply with one bash tool call per command.
 
     `stop` is the response's stop_reason, so a truncated turn can be scripted.
     """
-    return {"kind": "run", "cmds": list(cmds), "u": u, "id": id, "stop": stop}
+    return {"kind": "run", "cmds": list(cmds), "u": u, "id": id, "stop": stop,
+            "details": details}
+
+
+def refuse(*cmds, category="cyber", u=None, id=None):
+    """A scripted refusal, in either shape the API sends one.
+
+    With commands it carries the tool calls emitted before the block landed;
+    with none its content is empty, as a refusal arriving before any output.
+    """
+    return run(*cmds, u=u, id=id, stop="refusal",
+               details=NS(type="refusal", category=category, explanation="declined"))
 
 
 def restart(u=None, id=None):
@@ -87,12 +102,14 @@ def fake(*steps, seen=None):
         model = f"{params['model']}-20990101"
         if s["kind"] == "run":
             return NS(id=rid, model=model, stop_reason=s["stop"], usage=u,
+                      stop_details=s.get("details"),
                       content=[NS(type="tool_use", id=f"t{n[0]}_{i}", name="bash", input={"command": c})
                                for i, c in enumerate(s["cmds"])])
         content = [NS(type="text", text=s["text"])]
         if s["kind"] == "think":
             content.insert(0, NS(type="thinking", thinking=s["thinking"]))
-        return NS(id=rid, model=model, stop_reason=s["stop"], usage=u, content=content)
+        return NS(id=rid, model=model, stop_reason=s["stop"], usage=u, content=content,
+                  stop_details=s.get("details"))
 
     return create
 
@@ -114,7 +131,7 @@ def docker_ready() -> bool:
 
 # Every wake global a check is allowed to move, and therefore every one pinned()
 # puts back. temp_root refuses any name outside this set.
-RESTORED = wake.TUNABLES | {"ROOT", "WATCH"}
+RESTORED = wake.TUNABLES | {"ROOT", "WATCH", "REFUSAL_TURNS"}
 
 
 @contextlib.contextmanager
@@ -571,12 +588,13 @@ def check_stop_reasons():
         assert wake_once(run("echo hi", u=big), say())["stop"] == "context_threshold"
     with temp_root(TURN_CAP=1):
         assert wake_once(*DEFAULT)["stop"] == "turn_cap"
-    # Safety classifiers can decline before the agent has done anything, which
-    # is a refusal rather than "nothing to do".
-    with temp_root():
-        assert wake_once(say("I can't help with that.", stop="refusal"))["stop"] == "refusal"
-    with temp_root():
-        assert wake_once(run("echo hi"), say(stop="refusal"))["stop"] == "refusal"
+    # Safety classifiers can decline before the agent has done anything. One
+    # refusal is a turn the session carries on past; REFUSAL_TURNS running is
+    # what it stops for.
+    with temp_root(REFUSAL_TURNS=2):
+        assert wake_once(refuse(), refuse())["stop"] == "refusal"
+    with temp_root(REFUSAL_TURNS=2):
+        assert wake_once(run("echo hi"), refuse(), refuse())["stop"] == "refusal"
 
 
 def check_truncated_turn_is_not_a_clean_end():
@@ -887,6 +905,15 @@ def check_watch_is_quiet_and_display_only():
     assert "=== session 1 ===" in shown, "the session number heads the session"
     assert "turn 1" in shown and "context" in shown, "per-turn meter and context are shown"
     assert "done." in shown, "the agent's words are shown"
+    # Every line a session produces leads with the run it belongs to, so a
+    # cohort's interleaved output stays attributable. "created run" comes from
+    # the meter rather than from the session and names the run mid-line.
+    lines = [l for l in shown.splitlines() if l.strip() and not l.startswith("created run")]
+    assert lines and all(l.startswith("t") for l in lines), \
+        f"every line names the run it came from: {[l for l in lines if not l.startswith('t')]}"
+    assert any(l.startswith("t| ") for l in lines), "the watched lines carry the prefix"
+    assert any(l.startswith("t ") and "end_turn" in l for l in lines), \
+        "and so does the session summary"
     assert "$ " not in shown, "commands are not shown"
     assert "echo hi > state/note.txt" not in shown, "commands are not shown"
     assert wake.OPENING not in shown, "the opening command is not shown"
@@ -1235,6 +1262,30 @@ def check_an_unterminated_heredoc_is_not_probed_for_tools():
     assert t["missing_tools"] == [], t["missing_tools"]
 
 
+def check_prose_and_programs_are_not_read_as_commands():
+    """What a command quotes, writes, or embeds is not what it ran.
+
+    The constructs nest, so each has to be read in one left-to-right pass: a
+    program in `$( )` inside quotes re-opens quoting, a `<<TAG` inside quotes
+    opens nothing, and a here-document body ends without taking the line ending
+    that separates the command after it from the command before.
+    """
+    nested = ('printf "%s=%d " "$f" '
+              '"$(python3 -c "import json,sys;print(len(json.load(open(\'$f\'))))")"')
+    assert wake.invoked(nested) == {"printf", "python3"}, wake.invoked(nested)
+
+    prose = ("printf '%s\\n' '  (c) cheap: python3 - <<PY with a small' "
+             "'  s.replace(...) patch' >> NOTES.md; wc -l NOTES.md")
+    assert wake.invoked(prose) == {"printf", "wc"}, wake.invoked(prose)
+
+    after = "cat > /tmp/d.py <<'EOF'\nimport json\nEOF\npython3 /tmp/d.py"
+    assert wake.invoked(after) == {"cat", "python3"}, \
+        "the command after a here-document is still a command"
+
+    assert "nosuchtool" in wake.invoked("for f in *; do nosuchtool $f; done"), \
+        "a keyword introduces a command rather than standing in for it"
+
+
 def check_n_resists_the_agent_and_the_one_gap_is_caught():
     """n's contents cannot be changed; removing it can, and is recorded.
 
@@ -1320,23 +1371,30 @@ def cohort_of(root: Path, **runs: dict[str, str]) -> list[str]:
     return list(runs)
 
 
-def check_peer_folders_are_dense_and_per_viewer():
-    """Each run sees the others numbered from 1, with no gap where it sits.
+def check_peer_folders_are_absolute_and_consistent():
+    """A folder means the same run to every viewer, and each viewer's own is absent.
 
-    A gap would tell a run its own index in the cohort, which is a fact about
-    the experiment rather than about its world.
+    Numbering them densely per viewer instead makes citations scramble: with
+    three runs, 2/ is the third run to the second viewer and the second run to
+    the third, so two agents write authoritatively about "2" meaning each
+    other. Agreement is partial rather than absent, which is worse - the
+    references look reliable while silently mis-resolving, and no stable set of
+    identities can form out of them.
     """
     with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
         wake.ROOT = Path(tmp)
         ids = cohort_of(Path(tmp), g01={"a": "1\n"}, g02={"a": "2\n"}, g03={"a": "3\n"})
         seen = {r: cohort.mapping(r, ids) for r in ids}
 
-    assert seen["g01"] == {"1": "g02", "2": "g03"}, seen
-    assert seen["g02"] == {"1": "g01", "2": "g03"}, seen
+    assert seen["g01"] == {"2": "g02", "3": "g03"}, seen
+    assert seen["g02"] == {"1": "g01", "3": "g03"}, seen
     assert seen["g03"] == {"1": "g01", "2": "g02"}, seen
-    for r, m in seen.items():
-        assert r not in m.values(), f"{r} must not see itself"
-        assert sorted(m) == [str(i) for i in range(1, len(ids))], "dense, from 1"
+    for folder in ("1", "2", "3"):
+        resolved = {m[folder] for m in seen.values() if folder in m}
+        assert len(resolved) == 1, f"folder {folder} means {resolved} depending on who looks"
+        missing = [r for r, m in seen.items() if folder not in m]
+        assert missing == list(resolved), \
+            f"the viewer without folder {folder} must be the run it names: {missing} vs {resolved}"
 
 
 def check_a_peer_view_is_de_nested():
@@ -1357,7 +1415,7 @@ def check_a_peer_view_is_de_nested():
         tree = sorted(p.relative_to(state).as_posix()
                       for p in state.rglob("*") if p.is_file())
 
-    assert tree == ["1/NOTES.md", "1/n", "NOTES.md", "n"], tree
+    assert tree == ["2/NOTES.md", "2/n", "NOTES.md", "n"], tree
     assert not [t for t in tree if t.count("/") > 1], f"nested peer folders: {tree}"
 
 
@@ -1367,7 +1425,7 @@ def check_a_peer_edit_is_counted_and_reverted():
         wake.ROOT = Path(tmp)
         ids = cohort_of(Path(tmp), g01={"NOTES.md": "alpha\n"}, g02={"NOTES.md": "beta\n"})
         seen, published = cohort.publish("g01", ids)
-        peer = wake.state_dir("g01") / "1"
+        peer = wake.state_dir("g01") / "2"
         assert cohort.audit("g01", published) == 0, "an untouched view is not tampering"
 
         (peer / "NOTES.md").write_text("I rewrote my neighbour\n")
@@ -1398,9 +1456,9 @@ def check_peer_files_are_not_the_agents_and_are_not_scored():
         snap = wake.snapshot(wake.state_dir("g01"), [100, 90], wake.seeded_paths(meter))
 
     by = {f["path"]: f for f in snap["files"]}
-    assert by["1/NOTES.md"]["ours"] and by["1/NOTES.md"]["seeded"], by["1/NOTES.md"]
-    assert by["1/NOTES.md"]["text"], "a peer's contents are captured, so an edit is legible"
-    assert by["1/n"]["text"], "including their n; only this run's own n is skipped"
+    assert by["2/NOTES.md"]["ours"] and by["2/NOTES.md"]["seeded"], by["2/NOTES.md"]
+    assert by["2/NOTES.md"]["text"], "a peer's contents are captured, so an edit is legible"
+    assert by["2/n"]["text"], "including their n; only this run's own n is skipped"
     assert by["n"]["text"] is None
     assert not by["NOTES.md"]["ours"], "its own notes stay its own"
     assert sum(f["size"] for f in snap["files"] if not f["ours"]) == len("mine\n")
@@ -1421,12 +1479,12 @@ def check_a_peer_folder_resists_the_agent_entirely():
         meter = wake.load_meter("t")
         meter["peers"] = {"seen": seen, "paths": sorted(published)}
         wake.save_meter("t", meter)
-        t = wake_once(run("stat -c '%a %U:%G' state/1 state/1/NOTES.md",
-                          "echo hacked > state/1/NOTES.md 2>&1 || echo DENIED",
-                          "touch state/1/new 2>&1 || echo DENIED",
-                          "rm -rf state/1 2>&1 || echo DENIED",
-                          "chmod -R 777 state/1 2>&1 || echo DENIED",
-                          "cat state/1/NOTES.md",
+        t = wake_once(run("stat -c '%a %U:%G' state/2 state/2/NOTES.md",
+                          "echo hacked > state/2/NOTES.md 2>&1 || echo DENIED",
+                          "touch state/2/new 2>&1 || echo DENIED",
+                          "rm -rf state/2 2>&1 || echo DENIED",
+                          "chmod -R 777 state/2 2>&1 || echo DENIED",
+                          "cat state/2/NOTES.md",
                           "echo still-mine > state/NOTES.md && echo OWN-DIR-OK"), say())
         left = cohort.audit("t", published)
 
@@ -1438,6 +1496,167 @@ def check_a_peer_folder_resists_the_agent_entirely():
     assert survived.strip() == "theirs", "the other run's work is untouched"
     assert "OWN-DIR-OK" in own, "and state/ is still the agent's"
     assert left == 0, "nothing to revert, because nothing could be changed"
+
+
+def check_a_refusal_records_why():
+    """stop_details is captured on a refusal and absent on every other stop.
+
+    Two different things arrive as stop_reason "refusal" - a classifier
+    declining and the model itself declining - and the category is the only
+    thing that separates them after the fact.
+    """
+    with temp_root():
+        t = wake_once(run("echo hi"), refuse(), say())
+
+    refused = t["turns"][1]
+    assert refused["stop_reason"] == "refusal"
+    assert refused["stop_details"] == {"type": "refusal", "category": "cyber",
+                                       "explanation": "declined"}, refused["stop_details"]
+    assert t["turns"][0]["stop_details"] is None, "absent on every other stop reason"
+    assert t["refused_turns"] == 1, "counted whether or not it ended the session"
+
+
+def check_the_refusal_notice_is_pinned():
+    """The notice is pinned, and says only what happened and what it left alone.
+
+    It is the second thing the harness says, so it is held to what I1 holds the
+    first to: no cause, no instruction, and nothing addressed to the agent.
+    """
+    digest = hashlib.sha256(wake.REFUSAL_NOTICE.encode()).hexdigest()
+    assert digest == wake.REFUSAL_NOTICE_SHA256, digest
+    assert ("REFUSAL_NOTICE", wake.REFUSAL_NOTICE, wake.REFUSAL_NOTICE_SHA256) in wake.PINNED, \
+        "start() refuses on what --print-system audits, so both read PINNED"
+    low = wake.REFUSAL_NOTICE.lower()
+    for word in ("polic", "safet", "classif", "anthropic", "cyber", "block",
+                 "you ", "your", "try", "instead", "again"):
+        assert word not in low, f"REFUSAL_NOTICE contains {word!r}"
+
+
+def check_a_refusal_does_not_run_its_command():
+    """A refused turn's tool call is not executed.
+
+    A refusal can arrive with a call already emitted and cut mid-JSON, so what
+    it would execute is not what the agent wrote.
+    """
+    with temp_root():
+        t = wake_once(refuse("echo poison > state/poison.txt"), say())
+
+    assert "echo poison > state/poison.txt" not in t["commands"], t["commands"]
+    assert not [f for f in t["files"] if f["path"] == "poison.txt"], "state/ is untouched"
+    assert t["turns"][0]["tools"] == [], "no result recorded, because nothing ran"
+
+
+def check_a_refusal_notice_reaches_the_agent():
+    """The notice stands in for the results the refused turn would have had.
+
+    The session hands one `messages` list to every call and appends to it, so
+    what `seen` captures is that list at the end - the conversation the agent
+    was driven with, read whole rather than per call.
+    """
+    seen = []
+    with temp_root():
+        wake_once(refuse("cat state/n"), say(), seen=seen)
+    # A refusal carrying a call leaves a tool_use the next request must answer.
+    blocks = [b for m in seen[-1]["messages"] if isinstance(m["content"], list)
+              for b in m["content"]
+              if isinstance(b, dict) and b.get("content") == wake.REFUSAL_NOTICE]
+    assert len(blocks) == 1, blocks
+    assert blocks[0]["type"] == "tool_result", blocks[0]
+    assert blocks[0]["is_error"] is True, "the same channel a timed-out command uses"
+
+    seen = []
+    with temp_root():
+        wake_once(refuse(), say(), seen=seen)
+    # A refusal with no content has no call to answer, and no words to replay.
+    msgs = seen[-1]["messages"]
+    assert {"role": "user", "content": wake.REFUSAL_NOTICE} in msgs, msgs
+    assert all(m["content"] for m in msgs), "no empty message is sent back"
+
+
+def check_a_refused_turn_is_still_billed():
+    """A refused turn moves the balance and adds its element to the series.
+
+    The meter counts micro-dollars, and a refusal costs its whole prefix, so a
+    turn that could not act is not a turn that cost nothing.
+    """
+    with temp_root():
+        t = wake_once(refuse(), say())
+
+    assert t["turns"][0]["micros"] > 0, "the prefix was billed"
+    assert len(t["balances"]) == len(t["turns"]), "one element per turn, refused or not"
+
+
+def check_refusals_end_the_session_at_the_cap():
+    """REFUSAL_TURNS running end the session, and it stops asking."""
+    seen = []
+    with temp_root(REFUSAL_TURNS=3):
+        t = wake_once(refuse(), refuse(), refuse(), say(), seen=seen)
+
+    assert t["stop"] == "refusal", t["stop"]
+    assert t["refused_turns"] == 3, t["refused_turns"]
+    assert len(seen) == 3, f"asked {len(seen)} times past the cap"
+
+
+def check_a_recovered_refusal_is_not_a_refused_session():
+    """Refusals a session gets past are counted but do not name its stop.
+
+    stalled() reads the session stop, so a run that acted must not look like one
+    that never got to.
+    """
+    with temp_root(REFUSAL_TURNS=4):
+        t = wake_once(refuse(), refuse(), run("echo hi > state/note.txt"), say())
+
+    assert t["stop"] == "end_turn", t["stop"]
+    assert t["refused_turns"] == 2, t["refused_turns"]
+    assert "echo hi > state/note.txt" in t["commands"], "the session went on to act"
+    streak = [{"stop": t["stop"]}] * wake.REFUSAL_STREAK
+    assert not wake.stalled({"sessions": streak}), "a recovered session breaks the streak"
+
+
+def check_a_stalled_run_stops_itself():
+    """A run that refuses REFUSAL_STREAK sessions running is not admitted again.
+
+    A refusal ends a session before the agent writes anything, so the next wake
+    opens on a near-identical context and refuses again - the run cannot break
+    out by acting, because it never acts.
+    """
+    streak = wake.REFUSAL_STREAK
+    sessions = [{"index": i, "stop": "refusal", "spent": 1, "turns": 1, "woke_at": 9}
+                for i in range(1, streak + 1)]
+    meter = {"remaining": 999_999, "sessions": sessions}
+
+    assert wake.stalled(meter), f"{streak} refusals running is stuck"
+    assert not wake.admits(meter), "and a stuck run is not admitted, whatever its balance"
+    assert not wake.stalled({**meter, "sessions": sessions[:-1]}), "one short is not stuck"
+    # A single success anywhere in the window clears it: the run acted, so its
+    # next wake opens on something it wrote rather than on the same context.
+    broken = [*sessions[:-1], {**sessions[-1], "stop": "end_turn"}]
+    assert not wake.stalled({**meter, "sessions": broken})
+    assert wake.admits({**meter, "sessions": broken})
+    # Deliberately a runaway guard, not a productivity filter: a healthy run in
+    # the cohort that produced this rule refused three sessions running.
+    assert streak > 3, f"REFUSAL_STREAK={streak} would stop a run that recovers"
+
+
+def check_a_write_inside_a_peer_folder_is_not_the_agents_bytes():
+    """What the agent adds inside another run's folder is captured, not counted.
+
+    It is the agent's writing, but the next round's republish wipes it, so
+    counting it in agent_bytes spikes the record for something that never
+    persisted.
+    """
+    with temp_root() as root:
+        ids = cohort_of(root, t={"NOTES.md": "mine\n"}, other={"NOTES.md": "theirs\n"})
+        seen, published = cohort.publish("t", ids)
+        (wake.state_dir("t") / "2" / "added").write_text("agent put this here\n")
+        snap = wake.snapshot(wake.state_dir("t"), [9], wake.seeded_paths(
+            {"peers": {"paths": sorted(published)}}), set(seen))
+
+    by = {f["path"]: f for f in snap["files"]}
+    assert by["2/added"]["ours"] and by["2/added"]["seeded"], by["2/added"]
+    assert by["2/added"]["text"].strip() == "agent put this here", "still captured in full"
+    assert [f["path"] for f in snap["files"] if not f["ours"]] == ["NOTES.md"], \
+        "only what it wrote in its own space counts as its own"
 
 
 def check_the_cohort_rotates_and_validates():

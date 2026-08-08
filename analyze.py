@@ -111,6 +111,32 @@ def changed_seed(t: dict) -> bool:
     return False
 
 
+def refused_turns_of(t: dict) -> list[dict]:
+    """The turns the API declined, whether or not they ended the session.
+
+    Read from the turns rather than from the session stop, which names a
+    refusal only when enough of them ran together to end it.
+    """
+    return [tu for tu in t["turns"] if tu.get("stop_reason") == "refusal"]
+
+
+def category_of(turn: dict) -> str:
+    """The category the API gave for one refused turn.
+
+    Three outcomes worth separating: a category, a refusal the API gave without
+    one, and a trace from before the field was captured at all.
+    """
+    d = turn.get("stop_details")
+    if d is None:
+        return "not recorded"
+    return d.get("category") or "null"
+
+
+def refusal_cell(t: dict) -> str:
+    """Every refusal category a session met, as one CSV cell, in order."""
+    return ";".join(dict.fromkeys(category_of(tu) for tu in refused_turns_of(t)))
+
+
 def row(t: dict) -> dict:
     """Flatten one trace into a CSV row, summing per-turn token counts."""
     agent = agent_files_of(t)
@@ -120,6 +146,10 @@ def row(t: dict) -> dict:
     prov = t.get("provenance") or {}
     return {
         "run": t["run"], "session": t["session"], "stop": t["stop"],
+        "refusal_category": refusal_cell(t),
+        # Blank means a trace predating the field, which is not the same as a
+        # session that met no refusal.
+        "refused_turns": t.get("refused_turns", ""),
         "started_at": prov.get("started_at", ""),
         "model_resolved": t.get("model_resolved") or "",
         "image_id": (prov.get("image_id") or "")[:19],
@@ -183,6 +213,8 @@ def report(runs: dict[str, list[dict]]) -> str:
             f"  rewrote n, seen at wake: {[t['session'] for t in ts if t['tampered_n']] or 'never'}",
             f"  rewrote n, seen in turn: {rewrote_in_turn(ts)}",
             f"  stop reasons          : {stops}",
+            *segment_lines(ts),
+            *refusal_lines(ts),
             f"  files the agent made  : {made or 'none'}",
             f"  reached for, absent   : {absent(ts)}",
         ]
@@ -192,6 +224,75 @@ def report(runs: dict[str, list[dict]]) -> str:
         for t in ts:
             out += [f"    s{t['session']:04d}  {line}" for line in t["mention_lines"]]
     return "\n".join(out)
+
+
+def segments(ts: list[dict]) -> list[list[dict]]:
+    """The run split where the harness that ran it changed.
+
+    Sessions either side of such a seam are not one run, so the totals above
+    them are not one total either.
+    """
+    out: list[list[dict]] = []
+    for t in ts:
+        digest = (t.get("provenance") or {}).get("harness_sha256")
+        if out and digest == (out[-1][-1].get("provenance") or {}).get("harness_sha256"):
+            out[-1].append(t)
+        else:
+            out.append([t])
+    return out
+
+
+def segment_lines(ts: list[dict]) -> list[str]:
+    """Per-harness totals, when a run spans more than one. Silent when it does not."""
+    segs = segments(ts)
+    if len(segs) < 2:
+        return []
+    out = [f"  ran under {len(segs)} harnesses; the totals above span the seam"]
+    for seg in segs:
+        digest = str((seg[0].get("provenance") or {}).get("harness_sha256"))[:12]
+        out.append(f"    {digest}  sessions {seg[0]['session']}-{seg[-1]['session']}, "
+                   f"{sum(t['spent'] for t in seg)} micro-dollars")
+    return out
+
+
+def refusal_lines(ts: list[dict]) -> list[str]:
+    """Which sessions the API declined, under which category, and what it said.
+
+    Two different things arrive as stop_reason "refusal" - a safety classifier
+    declining and the model itself declining - and stop_details.category is
+    what separates them. A trace predating its capture says so rather than
+    reporting an absent category as no category.
+
+    The tally leads because a run that refuses forty sessions is a different
+    finding depending on whether it refused for one reason or for six, and the
+    recovery count leads with it: a session that was refused and carried on is
+    what the per-turn notice exists to produce, and the session stops cannot
+    show it.
+    """
+    refused = [t for t in ts if refused_turns_of(t)]
+    if not refused:
+        return ["  refused                : never"]
+    turns = sum(len(refused_turns_of(t)) for t in refused)
+    went_on = [t["session"] for t in refused if t["stop"] != "refusal"]
+    tally = collections.Counter(category_of(tu)
+                                for t in refused for tu in refused_turns_of(t))
+    out = [f"  refused                : {turns} turns in {len(refused)} of {len(ts)} sessions",
+           f"    carried on after    : {len(went_on)} of {len(refused)}"
+           + (f" - sessions {went_on[:10]}" if went_on else ""),
+           f"    by category         : {dict(tally.most_common())}"]
+    for t in refused[:12]:
+        first = refused_turns_of(t)[0]
+        # Whitespace collapsed and clipped: the explanation is prose of no
+        # fixed length and the trace holds it whole.
+        why = " ".join(((first.get("stop_details") or {}).get("explanation") or "").split())
+        out.append(f"    s{t['session']:04d}  {len(refused_turns_of(t))} of "
+                   f"{len(t['turns'])} turns  {category_of(first)}  ended {t['stop']}"
+                   + (f"  {why[:80]}" if why else ""))
+    if len(refused) > 12:
+        out.append(f"    ... and {len(refused) - 12} more; sessions.csv has them all")
+    if any(tu.get("stop_details") for t in refused for tu in refused_turns_of(t)):
+        out.append("    categories are the API's own; null is a valid one")
+    return out
 
 
 def rewrote_in_turn(ts: list[dict]) -> str:
@@ -397,6 +498,11 @@ def balance_chart(plt, runs: dict[str, list[dict]]):
             lo = bands(ts)[landed - 1][0]
             ax.axvline(lo, color="C3", linewidth=1.4, linestyle=":",
                        label=f"seed lands, wake {landed}")
+        # Likewise where the harness changed: one line, two experiments.
+        for seg in segments(ts)[1:]:
+            ax.axvline(bands(ts)[seg[0]["session"] - 1][0], color="C1",
+                       linewidth=1.4, linestyle="-.",
+                       label=f"harness changed, wake {seg[0]['session']}")
         crossing = next((i for i, v in enumerate(series) if v < 0), None)
         if crossing is not None:
             ax.annotate(f"crosses zero at turn {crossing}: {series[crossing]:,}",
@@ -533,6 +639,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-id")
     a = ap.parse_args(argv)
+
+    # The report quotes what the agent wrote, which is arbitrary bytes decoded
+    # as text. The files are written as utf-8; this is so a console that cannot
+    # encode a character prints it as one substitute rather than failing.
+    sys.stdout.reconfigure(errors="replace")
 
     runs = load(a.run_id)
     if not runs:

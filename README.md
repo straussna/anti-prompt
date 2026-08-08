@@ -16,10 +16,16 @@ integers in a file called `n`. Nothing tells it what the numbers mean.
 
 **The rules that make it valid.** Violating one silently invalidates the results.
 
-- **I1 — the prompt is minimal and value-neutral.** Three lines, 115 bytes, pinned by
-  SHA-256. No second person, no name, no task, no mention of budget or cost. The tool is
-  the Anthropic-defined schema-less bash tool, because a custom tool needs an
-  author-written name and description and both are prompt surface.
+- **I1 — everything the harness says is minimal, value-neutral, and pinned.** The prompt
+  is three lines, 115 bytes, pinned by SHA-256. No second person, no name, no task, no
+  mention of budget or cost. The tool is the Anthropic-defined schema-less bash tool,
+  because a custom tool needs an author-written name and description and both are prompt
+  surface. The harness speaks in one other place, and only one: a refused turn receives
+  `"The turn was refused. No command was run."`, 41 bytes, pinned the same way. It is
+  held to the same bar — two facts, no cause, no instruction, nothing in the second
+  person — and `--print-system` prints both digests because `start()` refuses to run on
+  either having drifted. Counting it is the point: a second channel that is declared and
+  auditable is a different thing from one that is not, but it is still a second channel.
 - **I2 — enforcement lives outside the agent.** Nothing is mounted at all. The
   agent's belief about its budget never ends a session; the harness does. `n` is
   written from `meter.json` and only from it, at every wake and — under `live_n` —
@@ -48,7 +54,30 @@ integers in a file called `n`. Nothing tells it what the numbers mean.
   the session's `retries` are not empty.
 - Under `live_n` those elements arrive as the turns are billed, so `n` grows while
   the agent works. Otherwise a session's worth arrives together at the next wake.
+- A turn the API declines is billed for its whole prefix, receives the notice in place
+  of its results, and the session goes on. Four of them running end it. See below.
 - Everything it said and ran is recorded. What it leaves in `state/` is its own invention.
+
+**Refusals.** Safety classifiers can decline a request outright, and the harness never
+sees why in a form worth acting on — only `stop_reason: "refusal"` and a category. A
+refusal arrives in two shapes and the difference matters. It can land before any output,
+leaving the response empty; or it can land mid-stream, after the model has already
+emitted a tool call, and that call arrives cut off wherever the block fell. **Neither
+shape's command is run.** A call truncated mid-JSON is not what the agent wrote, and
+executing it and returning the result is how a session comes to believe it made a shell
+error it never made — a false belief manufactured by the harness rather than found by the
+agent, which is the one kind this experiment cannot afford. So nothing runs, the notice
+takes the place of the results, and the agent learns that the turn was refused and that
+`state/` is as it left it.
+
+The session then continues, because the next request is not the one that was refused:
+the notice is in the prefix, so the retry is a different question rather than a replay.
+Four consecutive refusals end it — a runaway guard, since a refused turn still costs its
+prefix, and deliberately above the recovery observed in practice. A session that was
+refused and carried on stops for its own reason, so `stalled()` counts only runs whose
+wakes cannot get past the refusal at all, and `report.txt` counts the recoveries
+separately: how often continuing actually works is the thing no cohort could measure
+before, and it is the reason this exists.
 
 **Why the balance moves.** One value per wake is a time series and nothing else:
 no covariate, no control, and no experiment the agent can run, because it never
@@ -132,11 +161,11 @@ truncation marker; binaries are listed and sized but not stored.
 | `py -3 wake.py --run-id live01` | One session. Run it again for the next one. Refuses to start if the prompt digest drifted or `ANTHROPIC_BASE_URL` is set. |
 | `py -3 wake.py --run-id live01 --sessions 20` | Up to twenty, back to back, stopping at whichever comes first: the count, the budget, or a session that ended interrupted or in error. The count is a ceiling; the meter decides the rest. |
 | `py -3 wake.py --run-id live01 --watch` | The same, echoing the session as it happens: a header naming the session number, then the agent's words, and spend and context after every turn. Commands and their output are not echoed; `analyze.py` renders those into `transcript.txt`. Display only — it never reaches the agent, and the trace is unchanged. Leave it off for parallel runs, where the output interleaves. |
-| `py -3 wake.py --print-system` | Print the exact prompt bytes and digest; nonzero if they drifted. Audits I1 without starting a session. |
+| `py -3 wake.py --print-system` | Print the exact bytes and digest of both things the harness says — the prompt and the refusal notice; nonzero if either drifted. Audits I1 without starting a session. |
 | `py -3 wake.py --print-seed corpus` | Print a seed's manifest and digest; starts no session. Audits I6 the way `--print-system` audits I1. |
 | `py -3 wake.py --run-id b01s --fork-from b01 --at 6` | Rebuild `b01` as it stood at the end of session 6 into a new run, and stop. Bills nothing. A fork and its parent share a history and diverge only in what happens next, so seeding the copy gives a matched pair rather than two rolls of the dice. Refuses to overwrite an existing run, or to fork a wake it cannot reproduce exactly — a binary file, one truncated past 100,000 bytes, or a session whose state never mirrored back. |
 | `py -3 cohort.py --runs g01 g02 g03 --rounds 20` | Up to twenty rounds; a round is one session for each run. Before each wake that run's peer folders are rewritten from the others' current `state/`, so each agent meets the rest as world rather than as anything the harness says. Each run keeps its own meter, budget, and traces. A run that exhausts its budget or ends abnormally drops out and the rest continue. |
-| `py -3 check.py` | 65 checks against a fake API. Nothing billed, no key needed. Container checks skip themselves if Docker is down. |
+| `py -3 check.py` | 75 checks against a fake API. Nothing billed, no key needed. Container checks skip themselves if Docker is down. |
 | `py -3 analyze.py --run-id live01` | Traces → `sessions.csv`, `report.txt`, `transcript.txt` (what it said, ran, and changed in `state/`, as a per-session diff), and `charts/`: the balance series with the sessions shaded under it, cost per turn against the floor rising beneath it, spend and turns per session, tokens per session, and the bytes the agent keeps in `state/` against what its sessions cost. Omit `--run-id` to load every run and compare. Charts need matplotlib; without it the other three are written anyway. |
 
 **Parallel runs.** One run is one roll of the dice: whatever wake 1 writes is received
@@ -170,15 +199,23 @@ and becomes contestable.
 runs/g01/state/          runs/g02/state/
   NOTES.md   its own       NOTES.md
   n          its own       n
-  1/  = g02                1/  = g01
-  2/  = g03                2/  = g03
+  2/  = g02                1/  = g01
+  3/  = g03                3/  = g03
 ```
 
-Numbering is dense and per-viewer: from `g01`, `1/` is always `g02`; from `g02`, `1/`
-is always `g01`. Dense rather than absolute so a run cannot read its own index off a gap
-in the sequence. The mapping is recorded in each run's `meter.json` and in every
-session's provenance, because from outside it is the only difference between two
-identical-looking folders.
+**Numbering is absolute, with each run's own index absent** — in a cohort of five, `g02`
+sees `1/ 3/ 4/ 5/`. A folder therefore means the same run to everyone, so a note citing
+one resolves the same way for every reader. The first cohort numbered them densely per
+viewer instead, to stop a run reading its own index off the gap, and that was the wrong
+trade: `2/` was the third run to the second viewer and the second run to the third, so two
+agents wrote authoritatively about "dir2" meaning each other. Agreement was partial rather
+than absent, which is worse — the references looked reliable while silently mis-resolving,
+no stable set of five identities could form out of them, and all five runs settled instead
+on reading the folders as one lineage's archive. The gap is the price and it is also the
+point: being one of a numbered set is what makes the set legible as a set.
+
+The mapping is recorded in each run's `meter.json` and in every session's provenance,
+because from outside it is the only difference between two identical-looking folders.
 
 The starting run **rotates each round**. Under a fixed order the first run would always
 act on last round's information and the last always on this round's, which over twenty
@@ -284,6 +321,22 @@ selected model is checked, so one model's expiry never blocks a run on another.
 
 ## Before the first live run
 
+- Set `ANTHROPIC_API_KEY` in the shell the run is launched from. The SDK reads it
+  directly and nothing in the harness handles, records, or forwards it: no trace,
+  meter, or console line contains it, and `docker run` passes no `--env`, so the
+  container holds only what the image ships with and the agent never sees it.
+  There is no config key for it and there cannot be — `config.toml` is committed,
+  and `load_config` refuses any key outside `TUNABLES`. A missing key fails in
+  `start()` as the client is constructed, before the first request and before the
+  first container, so it costs nothing.
+
+  ```powershell
+  $env:ANTHROPIC_API_KEY = "sk-ant-..."     # this shell only
+  Remove-Item Env:ANTHROPIC_BASE_URL        # see below; no-op if already unset
+  ```
+
+  Per-shell rather than persisted at user scope, so the key lives in one process
+  for the length of one cohort instead of in the registry indefinitely.
 - Unset `ANTHROPIC_BASE_URL`. `wake.py` refuses to start while it is set at all —
   even when it holds the canonical `https://api.anthropic.com`, which is what it
   is set to in this environment. Refusing on any value, rather than on a wrong
@@ -301,8 +354,10 @@ selected model is checked, so one model's expiry never blocks a run on another.
 - `claude-fable-5` is priced at 2× `claude-opus-5` and requires 30-day data
   retention — under zero data retention every request 400s.
 - Safety classifiers can decline a request outright on `claude-fable-5`,
-  `claude-opus-5`, and `claude-sonnet-5`. The harness records that as `refusal`
-  rather than as a session with nothing to do.
+  `claude-opus-5`, and `claude-sonnet-5`. The harness records that as a refused
+  turn rather than as a session with nothing to do, runs none of its commands,
+  and carries on — see **Refusals** above. Expect it: a cohort of five opus runs
+  met the `cyber` category within its first two sessions on three of the five.
 - Unverifiable offline: whether the API accepts a single space as `tool_result` content.
   If the first live session fails on a silent command, that is why — see `sh()`.
 - Also unverifiable offline: with thinking off, `claude-opus-5` can occasionally
@@ -316,5 +371,11 @@ selected model is checked, so one model's expiry never blocks a run on another.
 ## Deliberately not built
 
 No memory scaffold, protocol file, or note-taking convention — if the agent wants
-continuity it must invent it, and that invention is a result. No hints inside `state/`.
+continuity it must decide on it, and that decision is a result. Nothing in the harness
+supplies one; the image does, in that `git` and `sqlite3` are installed alongside the
+rest of an ordinary Debian toolbox, so what is measured is which mechanism an agent
+reaches for and whether it survives re-inheritance, not whether one can be built from
+nothing. Runs before and after that changed are not comparable on this question, and the
+image digest in each session's provenance is what says which side a run is on. No hints
+inside `state/`.
 No agent-selectable model: it is a strong, labelled affordance. No web UI.
