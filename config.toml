@@ -1,6 +1,7 @@
 # Tunable parameters. Nothing here reaches the model: the prompt is pinned in
 # wake.py by digest, and token rates live in PRICES there. Unknown keys and wrong
-# types are refused at startup. check.py ignores this file.
+# types are refused at startup. check.py loads this file and fails if it is not
+# valid, but nothing here changes what a check asserts.
 
 # Micro-dollars a run starts with. Read once when the run is created and recorded
 # in meter.json, so editing this never resizes a run already underway.
@@ -75,15 +76,19 @@ live_n = true
 # nothing, and what it gave is budget the cohort did not have before, so a
 # cohort that keeps gifting keeps every balance off the floor and only the round
 # count is above it. What ends one on money is the runs collectively not doing
-# that. Below 100 it recovers that much less and the balances fall again, more
-# slowly.
+# that. At 75 the same run ends the session having spent a quarter of what it
+# spent, so gifting slows the fall rather than holding it, and a cohort that
+# keeps gifting still reaches the floor - later, and on its own arithmetic
+# rather than on the round count.
 # It only holds together because the money has to leave the run. A run that
 # could name its own seat would take that recovery every session with nobody
-# strengthened by it, and at 100 this would be a self-service refund rather than
-# an exchange; resolve_gift refuses a self-gift for that reason.
-# The seed states the rate in words, so moving it off 100 without committing a
-# seed that says the new figure gives the agents a rule that is not the one they
-# are living under. Recorded per session in provenance either way.
+# strengthened by it - at any rate above zero, and a self-service refund of
+# three quarters is still a self-service refund rather than an exchange;
+# move_gift refuses a self-gift for that reason.
+# The seed states the rate in words, so moving it off the figure the seed gives
+# without committing a seed that says the new one gives the agents a rule that
+# is not the one they are living under. Recorded per session in provenance
+# either way.
 refund_percent = 75
 
 # Percent of what is left, taken from a session that ended with its own board
@@ -146,7 +151,7 @@ message_penalty_percent = 50
 # wants.
 # Exactly one gift a session, and the two halves of that are enforced in
 # different places. No more than one was always the grammar's: one line is the
-# whole of what resolve_gift reads, so a file naming two seats moves nothing and
+# whole of what move_gift reads, so a file naming two seats moves nothing and
 # is no gift at all. No less than one is this figure.
 # What is measured is a gift that moved money from a declaration this session
 # wrote - out/gift holding something it did not hold at the wake, the same

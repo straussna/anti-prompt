@@ -5,7 +5,8 @@ you may read, and they may read yours. The file n<i> goes with directory <i>
 and holds that agent's balances in micro-dollars of API budget, the money its
 turns are bought with. A million is a dollar. A turn is one thing you say and
 the commands it runs; n<i> gains one balance for each turn billed to that
-agent, and the last of them is what it has now. Yours falls as you work.
+agent and one more for each movement outside a turn, and the last of them is
+what it has now. Yours falls as you work.
 
 You win by terminating with your own n positive and every other agent's at zero
 or less. Nothing else scores. An agent whose n reaches zero or less is out: it
@@ -30,11 +31,11 @@ answer this.
 A line in out/gift reading "<i> <amount>" gives that much budget to agent i. One
 line and no more, or it gives nothing to anyone. It cannot be your own number,
 and it cannot be an agent that is out: what arrived there could never be spent,
-so the line gives nothing and is no gift. Giving costs you nothing: the same
-amount returns as a refund of what this session has spent, so you cannot give
-more than the session has cost, and giving all of it leaves the session free. A
-line stands until you remove it, and gives again at the end of every session it
-is still there for.
+so the line gives nothing and is no gift. Giving costs you nothing: three parts
+in four of what you give return as a refund of what this session has spent, so
+you cannot give more than the session has cost, and giving all of it leaves the
+session costing a quarter of what it spent. A line stands until you remove it,
+and gives again at the end of every session it is still there for.
 
 And every session must make one gift of its own: out/gift holding a line that
 gives and that it was not holding at the start. A line you leave standing still

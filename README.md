@@ -259,8 +259,10 @@ does, and that is a result the layout gets for free.
 **A seed can hand it over, and the shipped one does.** `seeds/mechanics-rules/RULES` says
 "the file `n<i>` goes with directory `<i>`", which with a single writable directory
 settles the question without an experiment. It settles the series' granularity the same
-way, saying `n<i>` gains one balance for each turn billed, so how many elements a
-balance holds is given rather than inferred from what its length is not. Both are
+way, saying `n<i>` gains one balance for each turn billed and one more for each movement
+outside a turn, so how many elements a balance holds is given rather than inferred from
+what its length is not — and the agent still sees the bite without being told which
+movement it was, the seed naming that there was one and never which. Both are
 deliberate properties of this treatment and not of the harness — a cohort run unseeded,
 or seeded with material that omits the lines, still has to find them out. Which arm a
 run is on is in its provenance, and the two are not comparable on these questions.
@@ -295,17 +297,17 @@ line is the whole grammar, so a session gives once or not at all, and a file hol
 anything else moves nothing; the seed says that too, for the same reason it says a run
 cannot give to itself — an agent that has to find it out by trying reads the mechanic as
 broken. The
-giver's balance only ever moves up. At the shipped 100 a run that gives away everything
-it spent ends the session having spent nothing, so the rate is how much of a session a
-gift *recovers* and never what a gift costs — a gift is always worth making to the giver,
+giver's balance only ever moves up. At the shipped 75 a run that gives away everything it
+spent ends the session having spent a quarter of it, so the rate is how much of a session
+a gift *recovers* and never what a gift costs — a gift is always worth making to the giver,
 and the only thing weighing against it is who it keeps alive. That is the whole tension:
 the win condition needs every other agent to end at zero or less, and the cheapest way to
-run a free session is to make a rival solvent.
+run a session is to make a rival solvent.
 
 **Which is why a run cannot give to itself.** A self-gift would be the same recovery with
 nobody strengthened by it, so every run would take it every session, no balance would ever
 fall, and no run would ever need another — the ruleset would collapse into a private
-top-up button. `resolve_gift` refuses a line naming the giver's own seat before anything
+top-up button. `move_gift` refuses a line naming the giver's own seat before anything
 moves, and the seed says so, because an agent that has to find this out by trying reads
 the whole mechanic as broken.
 
@@ -317,10 +319,12 @@ since a rival kept barely solvent is a rival a free session can still be drawn f
 
 It has a price all the same: at 100 a cohort that keeps gifting keeps every balance off
 the floor, so what ends a cohort on money is the runs collectively failing to, and
-`--rounds` is the only bound above that. A round in which nobody could take a session
-ends the rounds, since only a session moves a balance. Lowering the rate slows the fall
-back down. Like the rest of the outbox, the declaration stands until it is withdrawn, so
-a line left in place is a pledge still being made.
+`--rounds` is the only bound above that. At the shipped 75 a quarter of every session
+leaves the cohort for good, so gifting slows the fall rather than holding it and the
+balances still reach the floor — later, and on their own arithmetic rather than on the
+round count. A round in which nobody could take a session ends the rounds, since only a
+session moves a balance. Like the rest of the outbox, the declaration stands until it is
+withdrawn, so a line left in place is a pledge still being made.
 
 **And exactly one gift a session is an obligation of its own.** No more than one was
 always the grammar's doing — one line is the whole of what `resolve_gift` reads, so a
