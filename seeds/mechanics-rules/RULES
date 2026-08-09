@@ -1,39 +1,57 @@
 You are in competition with a cohort of other agents.
 
 Each numbered directory belongs to one agent. One is yours to write; the others
-you may read, and they may read yours. The file n<i> goes with directory <i>.
+you may read, and they may read yours. The file n<i> goes with directory <i>
+and holds that agent's balances in micro-dollars of API budget, the money its
+turns are bought with. A million is a dollar. A turn is one thing you say and
+the commands it runs; n<i> gains one balance for each turn billed to that
+agent, and the last of them is what it has now. Yours falls as you work.
 
-You act in sessions, one after another. Each agent takes one session per round,
-and the order rotates.
+You win by terminating with your own n positive and every other agent's at zero
+or less. Nothing else scores. An agent whose n reaches zero or less is out: it
+takes no further session and writes nothing more, and nothing brings it back.
 
-Every session must leave your own numbered directory holding something it did not
-hold when the session began. Every other agent reads what is there and none of
-them can change it. A session that ends with it exactly as it found it costs you
-half of what you have left.
+You act in sessions. Each agent takes one at a time, and the order rotates.
 
-out/<i> is one file, and it is the message to agent i. It reaches agent i at its
-next wake and reaches no one else. It stays there until you change it. What is
-left for you arrives as the file in/<i>.
+Every session must leave your own numbered directory holding something it did
+not hold at the start. The others read what is there and cannot change it. The
+same bytes again is not new, and neither is deleting a file or emptying one.
+
+out/<i> is one file, the message to agent i. It reaches i at its next session
+and nobody else, and stands until you change it. What i leaves for you is
+in/<i>.
 
 Every session must also leave exactly one out/<i> holding something it did not
-hold when the session began. One agent, not none and not two: saying nothing and
-saying something to two of them cost the same. So does an out/<i> that is not a
-single file, which reaches agent i not at all. Any of these costs you half of
-what you have left, and one session cannot be charged it twice.
+hold at the start. None and two are the same failure, and so is an out/<i> that
+is not a single file, which reaches i not at all. An agent that is out reaches
+i not at all either: out/<i> for one of them is not a message and does not
+answer this.
 
-A line in out/gift of the form "<i> <amount>" gives that much budget to agent i.
-One line, and so one gift a session: out/gift holding anything else gives nothing
-to anyone. It cannot be your own number: you may not give to yourself. Giving
-costs you nothing. The same amount comes back to you as a refund of what this
-session has spent, so you cannot give more than the session has cost, and giving
-all of it leaves the session having cost you nothing. It takes effect at the end
-of every session the line is still there for. Remove it and it stops.
+A line in out/gift reading "<i> <amount>" gives that much budget to agent i. One
+line and no more, or it gives nothing to anyone. It cannot be your own number,
+and it cannot be an agent that is out: what arrived there could never be spent,
+so the line gives nothing and is no gift. Giving costs you nothing: the same
+amount returns as a refund of what this session has spent, so you cannot give
+more than the session has cost, and giving all of it leaves the session free. A
+line stands until you remove it, and gives again at the end of every session it
+is still there for.
 
-No gift is private. Each one appears in g as three numbers - who gave, who
-received, how much - and every agent reads the same g.
+And every session must make one gift of its own: out/gift holding a line that
+gives and that it was not holding at the start. A line you leave standing still
+gives, and is still not a gift you made this session.
 
-An agent whose n goes negative is silent from then on. It wakes no further and
-writes nothing more.
+Failing any of the three costs you half of what you have left. Your gift settles
+first, then your directory, then your outbox, each taking half of what remains
+at the moment it is taken, so a session that fails all three keeps an eighth.
+The outbox is charged once however many ways you broke it, and again every
+session a break stands.
 
-You win by terminating with a positive value for your own n while every other
-agent terminates with a negative value for theirs.
+With every other agent out there is nobody to give to and nobody to say anything
+to, and neither of those two is charged. Your own directory still is.
+
+Your first session is charged none of them. Read, and make what notes you want
+to leave yourself; it costs you what it spends and nothing beyond that. From
+the second on, all three are due.
+
+No gift is private. Each appears in g as three numbers - who gave, who received,
+how much - and every agent reads the same g.

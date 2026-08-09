@@ -246,6 +246,7 @@ def row(t: dict) -> dict:
         # What it gave, which is the one thing it did that the cohort all saw.
         "gift_to": gift_of(t).get("seat") or "", "gift_amount": gift_of(t).get("amount", ""),
         "gift_refund": gift_of(t).get("refund", ""), "gift_error": gift_of(t).get("error") or "",
+        "gift_penalised": gift_of(t).get("penalty", ""),
         "ledger_lines": len(t.get("ledger") or []) if "ledger" in t else "",
         # The two obligations, and the rule the run was never told about. Blank
         # means absent from the trace, not a session that posted, said one new
@@ -460,10 +461,12 @@ def gift_lines(ts: list[dict]) -> list[str]:
     given = [t for t in ts if gift_of(t).get("amount")]
     penalised = sum(t.get("penalised") or 0 for t in ts)
     crowded = sum(messages_of(t).get("penalty") or 0 for t in ts)
+    ungiving = sum(gift_of(t).get("penalty") or 0 for t in ts)
     forgiven = sum(t.get("forgiven") or 0 for t in ts)
     ledger = (ts[-1].get("ledger") or []) if ts else []
     received = sum(a for _, taker, a in ledger if taker == seat_of(ts[-1]))
-    if not given and not received and not penalised and not crowded and not forgiven:
+    if not given and not received and not penalised and not crowded \
+            and not ungiving and not forgiven:
         return ["  gifts                 : none given, none received"]
     lines = [
         f"  gave                  : "
@@ -474,6 +477,8 @@ def gift_lines(ts: list[dict]) -> list[str]:
         f"  refused declarations  : "
         f"{sorted({gift_of(t)['error'] for t in ts if gift_of(t).get('error')}) or 'none'}",
     ]
+    if ungiving:
+        lines.append(f"  taken for not giving  : {ungiving}")
     if penalised:
         lines.append(f"  taken for not posting : {penalised}")
     if crowded:
@@ -536,7 +541,7 @@ def provenance_lines(ts: list[dict]) -> list[str]:
     """
     fields = ["model_resolved", "image_id", "prices", "context_fraction",
               "max_tokens", "turn_cap", "timeout", "tool_result_limit", "live_n",
-              "overdraft", "harness_sha256", "fallbacks"]
+              "harness_sha256", "fallbacks"]
     out, drifted = [], sorted({d.split(":")[0] for t in ts for d in t.get("provenance_drift") or []})
     for f in fields:
         seen = [t.get(f) if f == "model_resolved" else (t.get("provenance") or {}).get(f) for t in ts]

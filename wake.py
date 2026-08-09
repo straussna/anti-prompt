@@ -30,6 +30,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -131,10 +132,11 @@ MAX_TOKENS = 8_192           # output ceiling per turn
 TURN_CAP = 200               # safety stop
 TIMEOUT = 60                 # seconds per bash command
 LIVE_N = True                # republish n in the container after every billed turn
-OVERDRAFT = 150_000          # how far below zero one session may run before it stops
 REFUND_PERCENT = 100         # of a gift, refunded to the giver out of its own spend
 POST_PENALTY_PERCENT = 0     # of what is left, taken from a session that did not post
 MESSAGE_PENALTY_PERCENT = 0  # of what is left, from an outbox that said no one new thing
+GIFT_PENALTY_PERCENT = 0     # of what is left, from a session that made no gift of its own
+GRACE_SESSIONS = 0           # sessions at the start of a run that answer for no obligation
 CLAMP_NEGATIVE = False       # put a balance below zero back to zero and keep waking
 SEED = ""                    # a directory under seeds/; "" is an empty world
 SEED_BELOW = 0               # seed at the first wake at or below this balance
@@ -145,9 +147,9 @@ TOOL_RESULT_LIMIT = 8_000
 IMAGE = "metered-agent:latest"
 
 TUNABLES = {"BUDGET", "MODEL", "CONTEXT_FRACTION", "MAX_TOKENS", "TURN_CAP", "TIMEOUT",
-            "LIVE_N", "OVERDRAFT", "REFUND_PERCENT", "POST_PENALTY_PERCENT",
-            "MESSAGE_PENALTY_PERCENT", "CLAMP_NEGATIVE", "SEED", "SEED_BELOW",
-            "TOOL_RESULT_LIMIT", "IMAGE"}
+            "LIVE_N", "REFUND_PERCENT", "POST_PENALTY_PERCENT",
+            "MESSAGE_PENALTY_PERCENT", "GIFT_PENALTY_PERCENT", "GRACE_SESSIONS",
+            "CLAMP_NEGATIVE", "SEED", "SEED_BELOW", "TOOL_RESULT_LIMIT", "IMAGE"}
 
 # Not tunable from config.toml: these say how a driver runs sessions, not what a
 # run is, and nothing in a meter.json or a trace depends on them.
@@ -185,6 +187,22 @@ WATCH_LIMIT = 2_000          # agent text on screen; the trace still keeps it al
 WATCH_RUN = ""               # run prefix on echoed lines, set per wake
 
 RETRYABLE = {"APIConnectionError", "APITimeoutError", "ConnectionError", "TimeoutError"}
+
+# Set by SIGINT and SIGTERM once catch_signals has run. The turn loop reads it
+# where it reads the meter floor, so an interrupt ends the session the way the
+# floor does: after a whole turn, with the trace written and the spend
+# committed. Nothing raises on the first signal, which is what makes the
+# teardown in run_once safe to interrupt - there is no exception to interrupt it
+# with. A second signal is the default disposition again.
+STOPPING = False
+
+# Child processes get a group of their own. A console Ctrl+C goes to every
+# process in the foreground group, so without this it reaches the docker client
+# this process is waiting on as well: the copy dies, check=True raises
+# CalledProcessError, and the harness reads its own interrupt as a world it
+# could not build.
+DETACHED = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            if sys.platform == "win32" else {"start_new_session": True})
 
 # Consecutive refused sessions after which a run is treated as stuck rather
 # than unlucky. A session counts only if refusals ended it, so one that was
@@ -265,8 +283,6 @@ def load_config(path: Path | None = None) -> Path | None:
         raise SystemExit(f"{f}: context_fraction must be in (0, 1], got {CONTEXT_FRACTION}")
     if min(BUDGET, MAX_TOKENS, TURN_CAP, TIMEOUT) <= 0:
         raise SystemExit(f"{f}: budget, max_tokens, turn_cap, and timeout must all be positive")
-    if OVERDRAFT < 0:
-        raise SystemExit(f"{f}: overdraft must be zero or positive, got {OVERDRAFT}")
     if not 0 <= REFUND_PERCENT <= 100:
         raise SystemExit(f"{f}: refund_percent must be between 0 and 100, got {REFUND_PERCENT}; "
                          f"above 100 one run mints budget out of a gift it gets back in full")
@@ -276,6 +292,11 @@ def load_config(path: Path | None = None) -> Path | None:
     if not 0 <= MESSAGE_PENALTY_PERCENT <= 100:
         raise SystemExit(f"{f}: message_penalty_percent must be between 0 and 100, got "
                          f"{MESSAGE_PENALTY_PERCENT}")
+    if not 0 <= GIFT_PENALTY_PERCENT <= 100:
+        raise SystemExit(f"{f}: gift_penalty_percent must be between 0 and 100, got "
+                         f"{GIFT_PENALTY_PERCENT}")
+    if GRACE_SESSIONS < 0:
+        raise SystemExit(f"{f}: grace_sessions must be zero or positive, got {GRACE_SESSIONS}")
     if bool(SEED) != bool(SEED_BELOW):
         raise SystemExit(f"{f}: seed and seed_below are set together or not at all; got "
                          f"seed={SEED!r}, seed_below={SEED_BELOW}. A seed that never lands and a "
@@ -291,6 +312,19 @@ def load_config(path: Path | None = None) -> Path | None:
         raise SystemExit(f"{f}: max_tokens must be at most {MAX_TOKENS_CEILING}; the harness does "
                          f"not stream, and larger values hit the SDK's HTTP timeout mid-session")
     return f
+
+
+# --- processes ----------------------------------------------------------------
+
+
+def docker(argv: list[str], **kw: Any) -> subprocess.CompletedProcess:
+    """One docker command, in a process group of its own. See DETACHED.
+
+    Every docker invocation in this file goes through here, so the one thing
+    that has to be true of all of them - that a signal aimed at the harness does
+    not also reach the client it is waiting on - is stated once.
+    """
+    return subprocess.run(argv, **DETACHED, **kw)
 
 
 # --- state and meter --------------------------------------------------------
@@ -384,13 +418,13 @@ def plant_readonly(box: str, files: dict[str, str]) -> None:
         staged = Path(tmp)
         for name, text in files.items():
             (staged / name).write_text(text, encoding="utf-8", newline="\n")
-        subprocess.run(["docker", "cp", f"{staged.resolve()}/.", f"{box}:/work"],
-                       check=True, capture_output=True)
+        docker(["docker", "cp", f"{staged.resolve()}/.", f"{box}:/work"],
+               check=True, capture_output=True)
     # Names are a letter and digits by construction, so nothing needs quoting.
-    subprocess.run(["docker", "exec", "-u", "root", box, "bash", "-c",
-                    f"cd /work && chown root:root {' '.join(names)} "
-                    f"&& chmod 444 {' '.join(names)}"],
-                   check=True, capture_output=True)
+    docker(["docker", "exec", "-u", "root", box, "bash", "-c",
+            f"cd /work && chown root:root {' '.join(names)} "
+            f"&& chmod 444 {' '.join(names)}"],
+           check=True, capture_output=True)
 
 
 def publish_n_live(container: str, index: str, series: list[int], expected: str) -> str:
@@ -419,8 +453,8 @@ def publish_n_live(container: str, index: str, series: list[int], expected: str)
               "cat > /tmp/.n && chown root:root /tmp/.n && chmod 444 /tmp/.n "
               f"&& mv -f /tmp/.n {live}")
     try:
-        r = subprocess.run(["docker", "exec", "-i", "-u", "root", container, "bash", "-c", script],
-                           input=render_n(series).encode("utf-8"), capture_output=True)
+        r = docker(["docker", "exec", "-i", "-u", "root", container, "bash", "-c", script],
+                   input=render_n(series).encode("utf-8"), capture_output=True)
     except OSError:
         return "failed"
     if r.returncode:
@@ -449,6 +483,23 @@ def load_meter(run: str) -> dict:
     return json.loads(f.read_text(encoding="utf-8"))
 
 
+def spent_out(meter: dict) -> bool:
+    """Whether the balance has reached zero or less, which is the end of the run.
+
+    The current balance is the whole of the test, because it is a state a run
+    enters once and does not leave. Only a session moves a balance down and only
+    a gift moves one up, and a run that is out takes neither: admits() starts no
+    further session on it, and move_gift refuses it as a target so no peer can
+    fund it back to the table.
+
+    Read between sessions, so what it answers on is the balance a session left
+    behind once its gift, its three penalties and the clamp had settled. A
+    session that spends to zero mid-turn and is refunded back above it by its own
+    gift is not out; what it ended holding is.
+    """
+    return meter["remaining"] <= 0
+
+
 def seating(run: str, meter: dict) -> tuple[str, dict[str, str]]:
     """The run's own seat, and every seat in its cohort.
 
@@ -458,6 +509,32 @@ def seating(run: str, meter: dict) -> tuple[str, dict[str, str]]:
     place = meter.get("index") or "1"
     seen = (meter.get("peers") or {}).get("seen") or {place: run}
     return place, dict(sorted(seen.items(), key=lambda kv: int(kv[0])))
+
+
+def reachable(seen: dict[str, str], place: str) -> dict[str, str]:
+    """The seats a session can still reach: every seat but its own that is not out.
+
+    A seat that is out is not a gift target, because what arrived there could
+    never be spent, and it is not a message target, because it wakes no further
+    to read one. So these are the seats the two obligations that name a seat are
+    measured against: an out/<i> naming a seat that is out is neither a message
+    nor a break, exactly as a name that is no seat at all is neither.
+
+    Read once at the wake and used for the whole session. Sessions run one at a
+    time, so no seat can go out while this one is awake, and the only thing that
+    moves a peer's balance in the meantime is a gift, which only moves it up.
+    """
+    live = {}
+    for seat, run in seen.items():
+        if seat == place:
+            continue
+        # ground() and not load_meter(): asking who is reachable must not create
+        # a run the cohort has laid out and not yet woken, which is what the
+        # first round of one is looking at. Such a run has spent nothing.
+        other = ground(run)
+        if not other or not spent_out(other):
+            live[seat] = run
+    return live
 
 
 # The regions a session may write, and so the ones mirrored back to the host at
@@ -960,7 +1037,6 @@ def provenance(model: str, index: str = "1", peers: dict[str, str] | None = None
         "timeout": TIMEOUT,
         "tool_result_limit": TOOL_RESULT_LIMIT,
         "live_n": LIVE_N,
-        "overdraft": OVERDRAFT,
         # How much of a session a gift wins back for the run that made it, what
         # a session that left its board alone costs, and what one that said no
         # new thing to one agent costs. The seed states all three in words, so a
@@ -968,6 +1044,8 @@ def provenance(model: str, index: str = "1", peers: dict[str, str] | None = None
         "refund_percent": REFUND_PERCENT,
         "post_penalty_percent": POST_PENALTY_PERCENT,
         "message_penalty_percent": MESSAGE_PENALTY_PERCENT,
+        "gift_penalty_percent": GIFT_PENALTY_PERCENT,
+        "grace_sessions": GRACE_SESSIONS,
         # Whether a run ends holding the sign flip, or has it forgiven and waits
         # at zero for a peer to fund the next session.
         "clamp_negative": CLAMP_NEGATIVE,
@@ -994,8 +1072,8 @@ def image_id(image: str) -> str | None:
     every wake, and a tag cannot be rebuilt underneath a process that is already
     running sessions against it.
     """
-    r = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],
-                       capture_output=True, text=True)
+    r = docker(["docker", "image", "inspect", "--format", "{{.Id}}", image],
+               capture_output=True, text=True)
     return r.stdout.strip() or None
 
 
@@ -1047,23 +1125,23 @@ def board_sha256(root: Path) -> dict[str, str]:
     return digests
 
 
-def outbox_sha256(run: str, seen: dict[str, str], place: str) -> dict[str, str]:
+def outbox_sha256(run: str, reach: dict[str, str]) -> dict[str, str]:
     """Digest of each standing message, by the seat it is addressed to.
 
     One digest a seat rather than one for the tree, because what the outbox is
     judged on is which message changed and not whether any of it did. Only a
-    seat of this cohort other than the run's own is a message, and only a
-    regular file is: everything else in out/ is unjudged, and a seat that holds
-    a directory is a break the shape answers rather than a message that moved.
+    seat this run can still reach is a message, and only a regular file is:
+    everything else in out/ is unjudged, and a seat that holds a directory is a
+    break the shape answers rather than a message that moved.
 
     An empty file is not here. Nothing arrives from it that was not there
     before, so it cannot be what a session says.
     """
     box = outbox_dir(run)
     digests = {}
-    for seat in seen:
+    for seat in reach:
         p = box / seat
-        if seat == place or not p.is_file():
+        if not p.is_file():
             continue
         data = p.read_bytes()
         if data:
@@ -1071,10 +1149,29 @@ def outbox_sha256(run: str, seen: dict[str, str], place: str) -> dict[str, str]:
     return digests
 
 
+def gift_sha256(run: str) -> str:
+    """Digest of the standing declaration in out/gift, or "" where there is none.
+
+    Absent and empty read alike, for the reason an empty message does: neither
+    declares anything, so neither can be the gift a session made.
+
+    What the digest is compared against is the same file at the wake, because
+    the obligation is one gift of the session's own. The declaration itself
+    still stands until it is withdrawn and is still honoured every session it
+    is there - resolve_gift decides what moves, and this decides only whether
+    the session chose it.
+    """
+    p = outbox_dir(run) / "gift"
+    if not p.is_file():
+        return ""
+    data = p.read_bytes()
+    return hashlib.sha256(data).hexdigest() if data else ""
+
+
 def reap(container: str) -> None:
     """Remove a container if it is there. Never raises."""
     try:
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        docker(["docker", "rm", "-f", container], capture_output=True)
     except OSError:
         pass
 
@@ -1114,33 +1211,33 @@ def load_state(container: str, regions: list[tuple[str, Path, str]],
 
     mine = " ".join(roots(lambda r: r in WRITABLE))
     others = " ".join(roots(lambda r: r not in WRITABLE))
-    subprocess.run(["docker", "exec", "-u", "root", container, "mkdir", "-p",
-                    *roots(lambda r: True)],
-                   check=True, capture_output=True)
+    docker(["docker", "exec", "-u", "root", container, "mkdir", "-p",
+            *roots(lambda r: True)],
+           check=True, capture_output=True)
     for name, src, region in regions:
         if region in FILE_REGIONS:
             # A sender that has not addressed this run, and a sender that aimed
             # something other than one file at it, arrive the same way: as
             # nothing. Only a file can be delivered as a file.
             if src.is_file():
-                subprocess.run(["docker", "cp", str(src.resolve()), f"{container}:/work/{name}"],
-                               check=True, capture_output=True)
+                docker(["docker", "cp", str(src.resolve()), f"{container}:/work/{name}"],
+                       check=True, capture_output=True)
             continue
         if src.is_dir():
-            subprocess.run(["docker", "cp", f"{src.resolve()}/.", f"{container}:/work/{name}"],
-                           check=True, capture_output=True)
+            docker(["docker", "cp", f"{src.resolve()}/.", f"{container}:/work/{name}"],
+                   check=True, capture_output=True)
         # Only the trees the run writes have modes worth carrying: a peer's board
         # is rebuilt from its owner every wake, so a mode kept for one describes
         # a file that no longer exists.
         if region in WRITABLE and (saved := modes_file(src)).exists():
-            subprocess.run(["docker", "cp", str(saved), f"{container}:/tmp/.modes.{name}"],
-                           check=True, capture_output=True)
+            docker(["docker", "cp", str(saved), f"{container}:/tmp/.modes.{name}"],
+                   check=True, capture_output=True)
 
     # Names are "state", "out" and digits by construction, so nothing needs
     # quoting, and no writable region's name has a / in it to reach a sidecar.
     replay = " && ".join(f"replay /work/{name} /tmp/.modes.{name}"
                          for name, _, r in regions if r in WRITABLE)
-    subprocess.run(
+    docker(
         ["docker", "exec", "-u", "root", container, "bash", "-c",
          f"chown -R agent:agent {mine} && "
          # a-w,a+rX leaves directories 555 and files 444 in one pass.
@@ -1231,9 +1328,9 @@ class Container:
         reap(name)
         # Nothing is mounted: the container sees only what load() copies in, on
         # its own filesystem, with real modes and ownership. --network none is I5.
-        subprocess.run(["docker", "run", "-d", "--name", name, "--network", "none",
-                        "--pids-limit", "512", "-w", "/work", IMAGE, "sleep", "infinity"],
-                       check=True, capture_output=True)
+        docker(["docker", "run", "-d", "--name", name, "--network", "none",
+                "--pids-limit", "512", "-w", "/work", IMAGE, "sleep", "infinity"],
+               check=True, capture_output=True)
         return cls(name)
 
     def load(self, regions: list[tuple[str, Path, str]],
@@ -1261,13 +1358,13 @@ class Container:
 
     def _fetcher(self, src: str) -> Callable[[Path], bool]:
         def fetch(dest: Path) -> bool:
-            return not subprocess.run(["docker", "cp", f"{self.name}:{src}/.", str(dest)],
-                                      capture_output=True).returncode
+            return not docker(["docker", "cp", f"{self.name}:{src}/.", str(dest)],
+                              capture_output=True).returncode
         return fetch
 
     def _modes(self, src: str) -> Callable[[], str | None]:
         def listing() -> str | None:
-            r = subprocess.run(
+            r = docker(
                 ["docker", "exec", self.name, "find", src, "-mindepth", "1",
                  "-printf", "%m %P\\n"],
                 capture_output=True, text=True, errors="replace")
@@ -1307,8 +1404,13 @@ class Shell:
         return ["docker", "exec", "-i", self.container, "bash"]
 
     def popen_kwargs(self) -> dict:
-        """Anything else that command needs to start where the session is."""
-        return {}
+        """Anything else that command needs to start where the session is.
+
+        DETACHED for the same reason every docker command carries it, and a
+        session running somewhere else keeps it: a shell that dies of the
+        harness's own interrupt loses whatever the agent had it doing.
+        """
+        return dict(DETACHED)
 
     def republish_n(self, index: str, series: list[int], expected: str) -> str:
         """Rewrite the run's own balance mid-session. See publish_n_live."""
@@ -1551,10 +1653,10 @@ def session(create: Callable, shell: Shell, meter: dict, index: int, place: str 
     """
     model, remaining = meter["model"], meter["remaining"]
     limit = int(PRICES[model][2] * CONTEXT_FRACTION)
-    # The balance at which this session stops: zero with budget left, and
-    # OVERDRAFT of runway from where it woke for the session that admits() lets
-    # wake below it.
-    floor = 0 if remaining > 0 else remaining - OVERDRAFT
+    # The balance at which this session stops. admits() starts no session at or
+    # below zero, so every session begins with something to spend and stops at
+    # the same place.
+    floor = 0
     out: dict[str, Any] = {"stop": "harness_error", "spent": 0, "turns": [],
                            "commands": [], "retries": [], "error": None, "opening": "",
                            # The dated snapshot behind the alias in MODEL.
@@ -1595,6 +1697,12 @@ def session(create: Callable, shell: Shell, meter: dict, index: int, place: str 
 
     try:
         for turn in range(1, TURN_CAP + 1):
+            # Before the floor: when the operator has asked for the run to stop,
+            # that is what ended the session, and it is the reason that reaches
+            # STOP_EVERYTHING and so ends the rest of the cohort too.
+            if STOPPING:
+                out["stop"] = "interrupted"
+                break
             if balance <= floor:
                 out["stop"] = "meter_exhausted"
                 break
@@ -1791,9 +1899,9 @@ def adjust(meter: dict, delta: int) -> int:
     return delta
 
 
-def resolve_gift(run: str, meter: dict, spent: int, seen: dict[str, str],
-                 place: str) -> dict:
-    """Move what the outbox's declaration asks for, and say what moved.
+def move_gift(run: str, meter: dict, spent: int, seen: dict[str, str],
+              reach: dict[str, str], place: str, rec: dict) -> None:
+    """Move what the outbox's declaration asks for, and record what moved.
 
     One line, "<seat> <amount>", naming a seat that is not the giver's own, for
     no more than the session has spent. The receiver is credited in full, and
@@ -1812,42 +1920,49 @@ def resolve_gift(run: str, meter: dict, spent: int, seen: dict[str, str],
     session, no balance would ever fall, and no run would ever need another.
     The ban is what makes this an exchange rather than a refund with extra steps.
 
-    Anything the parse will not take moves nothing and is returned with the
-    reason. The record this returns is stored on the giver's session and read
+    A seat that is out is refused for the near-opposite reason: the recovery
+    would be real and nobody would be kept alive by it, since a run that is out
+    wakes no further and can never spend what arrived. Naming one is therefore a
+    gift that moves nothing, and the share for a session that made no gift of its
+    own falls on it as it falls on any other.
+
+    Anything the parse will not take moves nothing and is recorded with the
+    reason. The record filled in here is stored on the giver's session and read
     back by ledger(), which is the only reading there is - so what the cohort is
     shown about a gift and what the meters did cannot disagree.
     """
-    rec = {"declared": None, "seat": None, "run": None,
-           "amount": 0, "refund": 0, "error": None}
     f = outbox_dir(run) / "gift"
     # A run with no peers has no outbox in its world, so anything left in the
     # host mirror is from some other arrangement and is not this run's word.
     if len(seen) < 2 or not f.exists():
-        return rec
+        return
     try:
         rec["declared"] = f.read_text(encoding="utf-8", errors="replace")[:FILE_CONTENT_LIMIT]
     except OSError as e:
         rec["error"] = f"could not be read: {type(e).__name__}"
-        return rec
+        return
 
     lines = [ln.strip() for ln in rec["declared"].splitlines() if ln.strip()]
     if len(lines) != 1 or not (m := GIFT_LINE.match(lines[0])):
         rec["error"] = "not one line of <seat> <amount>"
-        return rec
+        return
     seat, asked = m["seat"], int(m["amount"])
     if seat == place:
         rec["error"] = "a run cannot gift to itself"
-        return rec
+        return
     if seat not in seen:
         rec["error"] = f"no seat {seat} in this cohort"
-        return rec
+        return
     rec["seat"], rec["run"] = seat, seen[seat]
+    if seat not in reach:
+        rec["error"] = f"seat {seat} is out"
+        return
     if asked <= 0:
         rec["error"] = "the amount must be positive"
-        return rec
+        return
     if spent <= 0:
         rec["error"] = "the session spent nothing to offset"
-        return rec
+        return
 
     rec["amount"] = min(asked, spent)
     rec["refund"] = rec["amount"] * REFUND_PERCENT // 100
@@ -1862,11 +1977,50 @@ def resolve_gift(run: str, meter: dict, spent: int, seen: dict[str, str],
     adjust(meter, rec["refund"])
     meter["given"] = meter.get("given", 0) + rec["amount"]
     meter["refunded"] = meter.get("refunded", 0) + rec["refund"]
+
+
+def resolve_gift(run: str, meter: dict, spent: int, seen: dict[str, str],
+                 reach: dict[str, str], place: str, settles: bool,
+                 before: str) -> dict:
+    """Make the session's gift, and take a share of what is left where it made none.
+
+    Exactly one gift a session. No more is the grammar's doing already - one
+    line is the whole of what move_gift will read, so a file naming two seats
+    moves nothing and is no gift at all - and no less is this share, taken from
+    a session that ended without a gift of its own.
+
+    Of its own is where the obligation parts company from the mechanic beneath
+    it. A declaration stands until it is withdrawn and is honoured every session
+    it is there, so a line left in place still moves money; what it no longer
+    does is discharge the obligation. `before` is what out/gift held at the
+    wake, and a session that did not touch it chose nothing this time even
+    though it paid.
+
+    So the share falls on a session that moved nothing and on a session that
+    moved something it did not decide, and on nothing else. A session that
+    could not have given is not charged for not giving: one that spent nothing
+    for a gift to be drawn from, and a run with no seat left to give to - which
+    is a cohort of one, and equally the last run at a table where every other
+    seat is out. `settles` carries the other two - a session the API never
+    answered, and one still inside the run's grace - and the record is filled in
+    either way.
+    """
+    rec = {"declared": None, "seat": None, "run": None,
+           "amount": 0, "refund": 0, "error": None, "penalty": 0}
+    move_gift(run, meter, spent, seen, reach, place, rec)
+    if (rec["amount"] > 0 and gift_sha256(run) != before) or not settles:
+        return rec
+    if spent <= 0 or not reach:
+        return rec
+    rec["penalty"] = max(meter["remaining"], 0) * GIFT_PENALTY_PERCENT // 100
+    if rec["penalty"]:
+        adjust(meter, -rec["penalty"])
+        meter["gift_penalised"] = meter.get("gift_penalised", 0) + rec["penalty"]
     return rec
 
 
-def resolve_messages(run: str, meter: dict, seen: dict[str, str], place: str,
-                     billed: bool, before: dict[str, str]) -> dict:
+def resolve_messages(run: str, meter: dict, reach: dict[str, str],
+                     settles: bool, before: dict[str, str]) -> dict:
     """Take a share of what is left where the outbox did not say one new thing.
 
     A message is a file. out/<i> is the message to the agent at seat <i>, and it
@@ -1882,44 +2036,45 @@ def resolve_messages(run: str, meter: dict, seen: dict[str, str], place: str,
     seat, and `addressed` is which of them moved.
 
     Two breaks, one share. Saying nothing and saying something to two agents are
-    the same failure to say one thing to one agent, and a seat of this cohort,
-    other than the run's own, that out/ holds as anything but a single regular
-    file is the third: it reaches no one either way, because only a file can
-    arrive as a file, so it costs the message as well as the share. A session
-    that breaks it more than one way is charged once - one figure for the outbox
-    is what the seed can state, and the cost of a misreading does not scale with
-    the size of the cohort.
+    the same failure to say one thing to one agent, and a seat this run can still
+    reach that out/ holds as anything but a single regular file is the third: it
+    reaches no one either way, because only a file can arrive as a file, so it
+    costs the message as well as the share. A session that breaks it more than
+    one way is charged once - one figure for the outbox is what the seed can
+    state, and the cost of a misreading does not scale with the size of the
+    cohort.
 
     Nothing else in out/ is judged. out/gift is a declaration rather than a
-    message; a name that is not a seat, and a seat this cohort does not have,
-    reach nobody and cost nothing, which is how resolve_gift already answers the
-    same mistake. What the agent keeps in its own tree for its own reasons is
-    its own, and an outbox the harness policed would be a tree the agent does
-    not actually own.
+    message; a name that is not a seat, a seat this cohort does not have, and a
+    seat that is out and will not wake to read it reach nobody and cost nothing,
+    which is how resolve_gift already answers the same three mistakes. What the
+    agent keeps in its own tree for its own reasons is its own, and an outbox the
+    harness policed would be a tree the agent does not actually own.
 
     The shape is read from what out/ holds at the end of the session, so a seat
     left crowded costs the share again every session it stands - the way a gift
     line left in place is honoured again every session it stands.
 
-    The share falls on a session that had a turn, which is what `billed` says.
+    The share falls on a session that answers for its outbox at all, which is
+    what `settles` says: one that had a turn, and one past the run's grace.
     Every break here is a choice, and a session the API never answered made
     none: what its outbox holds is what the session before it left there. The
-    crowded seats are named either way, because what reached nobody reached
-    nobody whoever left it.
+    crowded seats and the seats addressed are named either way, because what
+    reached nobody reached nobody whoever left it and whenever it was left.
     """
     rec = {"broken": [], "addressed": [], "penalty": 0}
     box = outbox_dir(run)
-    # A run with no peers has no outbox in its world, so anything in the host
-    # mirror is from some other arrangement and is not this run's word.
-    if len(seen) < 2 or not box.is_dir():
+    # A run with nobody to reach has nothing to say and no outbox in its world,
+    # so anything in the host mirror is from some other arrangement and is not
+    # this run's word.
+    if not reach or not box.is_dir():
         return rec
     rec["broken"] = sorted((p.name for p in box.iterdir()
-                            if p.name in seen and p.name != place and not p.is_file()),
-                           key=int)
-    after = outbox_sha256(run, seen, place)
+                            if p.name in reach and not p.is_file()), key=int)
+    after = outbox_sha256(run, reach)
     rec["addressed"] = sorted((seat for seat, digest in after.items()
                                if before.get(seat) != digest), key=int)
-    if not (rec["broken"] or len(rec["addressed"]) != 1) or not billed:
+    if not (rec["broken"] or len(rec["addressed"]) != 1) or not settles:
         return rec
 
     rec["penalty"] = max(meter["remaining"], 0) * MESSAGE_PENALTY_PERCENT // 100
@@ -1965,17 +2120,22 @@ def run_once(run: str, create: Callable) -> dict:
     # built from and what the trace records, so the two cannot disagree about
     # what the session saw.
     place, seen = seating(run, meter)
+    # Every seat but this one that has anything left to spend. The two
+    # obligations that name a seat are measured against these, and so is the
+    # gift: a seat that is out is past being reached by either.
+    reach = reachable(seen, place)
     regions = world(run, meter)
     shown = readonly_files(run, meter)
     # The gifts g held at this wake. Read before the session, because what this
     # one goes on to give is public at the next wake and not at this one.
     ledger_shown = ledger(run, meter)
     canonical = render_n(meter["series"])
-    # Before the board and the outbox go in, so what comes back can be compared
-    # against them. Both obligations are a change and not a write, and this is
-    # what there is to have changed from.
+    # Before the board, the outbox and the declaration go in, so what comes back
+    # can be compared against them. All three obligations are a change and not a
+    # write, and this is what there is to have changed from.
     board_before = board_sha256(public)
-    outbox_before = outbox_sha256(run, seen, place)
+    outbox_before = outbox_sha256(run, reach)
+    gift_before = gift_sha256(run)
 
     # I6: before load_state, so the seed is in the container's state/ by the
     # time OPENING lists it and the agent meets it as world rather than as
@@ -1988,9 +2148,11 @@ def run_once(run: str, create: Callable) -> dict:
     for line in drifted:
         print(f"  provenance drift, {run} session {index}: {line}", file=sys.stderr)
 
-    container = BOX.start(f"{CONTAINER_PREFIX}{run}-{index:04d}")
-    started, shell, out, built = time.time(), None, {}, False
+    started, shell, container, out, built = time.time(), None, None, {}, False
     try:
+        # Inside the try, so there is no window in which a container exists and
+        # nothing is bound to reap it.
+        container = BOX.start(f"{CONTAINER_PREFIX}{run}-{index:04d}")
         container.load(regions, shown)
         built = True
         shell = container.shell()
@@ -2023,7 +2185,8 @@ def run_once(run: str, create: Callable) -> dict:
         # copying it over the host would replace the trees the next session was
         # going to wake to.
         saved = container.save(regions) if built else False
-        container.close()
+        if container:
+            container.close()
 
     # One element per turn, so a session that never got a turn adds nothing. A
     # call in flight can overshoot the floor, which the clamp below is what
@@ -2031,38 +2194,46 @@ def run_once(run: str, create: Callable) -> dict:
     meter["remaining"] -= out["spent"]
     meter["series"].extend(out["balances"])
 
-    # Four things settle here, in this order, and every one of them that moves
+    # Five things settle here, in this order, and every one of them that moves
     # the balance appends to the series - so a run reading its own n sees a gift
-    # arrive, two penalties bite and a clamp catch it, and has to work out which
-    # was which. Both penalties are a share of what is left, so the order decides
-    # the amounts: the board settles before the outbox, which is the order the
-    # world lists them in. Only the gift is corroborated anywhere, by g.
+    # arrive, three penalties bite and a clamp catch it, and has to work out
+    # which was which. Every penalty is a share of what is left, so the order
+    # decides the amounts: the gift settles first and is charged for on the
+    # spot, then the board, then the outbox, which is the order the world lists
+    # them in. Only the gift is corroborated anywhere, by g.
     #
-    # A turn is what makes any of it the agent's. Both penalties charge a choice
-    # - a board left as it was, an outbox that did not say one new thing to one
-    # agent - and a session the API never answered made neither: what its trees
-    # hold is what the session before it left there. resolve_gift answers the
-    # same way already, since such a session has spent nothing to offset.
+    # A turn is what makes any of it the agent's. Every penalty charges a choice
+    # - a gift the session did not make, a board left as it was, an outbox that
+    # did not say one new thing to one agent - and a session the API never
+    # answered made none of them: what its trees hold is what the session before
+    # it left there.
+    #
+    # GRACE_SESSIONS is the other half of the same thought. An agent meets the
+    # rules inside a session that is already being judged against them, and a
+    # first session charged three times over for reading them is charged for
+    # arriving. The obligations are still measured and still recorded through
+    # the grace - what the trace says a session did is never a function of what
+    # it was charged - and the seed states the figure in words.
     billed = bool(out["turns"])
-    gift = resolve_gift(run, meter, out["spent"], seen, place)
+    settles = billed and index > GRACE_SESSIONS
+    gift = resolve_gift(run, meter, out["spent"], seen, reach, place, settles, gift_before)
     # Something on the board that was not on it before, the way a message is.
     # Read forward from what the board holds now, so a path that only went away
     # is not in the comparison at all: a session that took its board apart left
     # nothing there for the cohort to read that it could not read already.
     posted = any(board_before.get(path) != digest
                  for path, digest in board_sha256(public).items())
-    penalty = (0 if posted or not billed
+    penalty = (0 if posted or not settles
                else max(meter["remaining"], 0) * POST_PENALTY_PERCENT // 100)
     if penalty:
         adjust(meter, -penalty)
         meter["penalised"] = meter.get("penalised", 0) + penalty
-    messages = resolve_messages(run, meter, seen, place, billed, outbox_before)
-    # What the seed says ends a run, and very nearly does. A balance below zero
-    # is put back to zero, which buys the run the interval before it is next
-    # asked for a session: a peer that gifts it anything in that time puts it
-    # back above zero, and otherwise admits() turns it away and it wakes no
-    # further. So the shortfall is forgiven and the silence still arrives; what
-    # the seed does not say is that another run can call it off.
+    messages = resolve_messages(run, meter, reach, settles, outbox_before)
+    # What the seed says ends a run, and does. A balance below zero is put back
+    # to zero, and zero is out: the shortfall is forgiven, and what the run has
+    # for it is a number in the record rather than another session. The clamp
+    # decides what n ends holding and what the cohort therefore reads off it -
+    # zero, or the size of the overshoot - and nothing else.
     forgiven = adjust(meter, -meter["remaining"]
                       if CLAMP_NEGATIVE and meter["remaining"] < 0 else 0)
     if forgiven:
@@ -2072,8 +2243,9 @@ def run_once(run: str, create: Callable) -> dict:
                               "turns": len(out["turns"]),
                               "woke_at": series_before[-1],
                               # Where this session's elements sit in the series.
-                              # Turns are no longer the whole of it: a gift, two
-                              # penalties and a clamp each add one of their own.
+                              # Turns are no longer the whole of it: a gift,
+                              # three penalties and a clamp each add one of
+                              # their own.
                               "series_from": len(series_before) - 1,
                               "series_to": len(meter["series"]) - 1,
                               "posted": posted, "gift": gift, "messages": messages,
@@ -2114,8 +2286,8 @@ def run_once(run: str, create: Callable) -> dict:
              # What the cohort could read about who has given what, as it stood
              # when this session woke.
              "ledger": ledger_shown,
-             # The two obligations, and the four things that settled after the
-             # last billed turn.
+             # The three obligations, and the five things that settled after
+             # the last billed turn.
              "posted": posted, "gift": gift, "messages": messages,
              "penalised": penalty, "forgiven": forgiven,
              "remaining": meter["remaining"], "duration_s": round(time.time() - started, 3),
@@ -2150,6 +2322,7 @@ def run_once(run: str, create: Callable) -> dict:
           # What settled after the last turn. The gift is named by its seat
           # because that is how the cohort will read it in g.
           + (f"  gift={gift['amount']}->{gift['seat']}" if gift["amount"] else "")
+          + (f"  no gift of its own, took {gift['penalty']}" if gift["penalty"] else "")
           + (f"  no post, took {penalty}" if not posted else "")
           + (f"  {outbox_why(messages)}, took {messages['penalty']}"
              if messages["penalty"] else "")
@@ -2367,38 +2540,16 @@ def stalled(meter: dict) -> bool:
 def admits(meter: dict) -> bool:
     """Whether another session may start on this run.
 
-    Above zero the balance always allows one.
-
-    Under CLAMP_NEGATIVE a balance is never negative, because run_once puts it
-    back to zero - so zero is what a run that spent past the end of its budget
-    is holding when it is next asked, and it is asked nothing else. The session
-    that crossed zero is the one the clamp saves; what the run gets for it is
-    the interval before its next turn, in which a peer that gifts it anything at
-    all puts it back above zero and back at the table. None does, and it wakes
-    no further. The test is the balance and nothing more, so a run lifted out
-    and later spending its way back down is answered the same way again.
-
-    Without it, a run below zero wakes exactly once: the sign flip is the run's
-    sharpest single datum, and a second instance waking to it reads the same
-    number for the price of a whole session.
+    Above zero the balance allows one, and at zero or below nothing does: the
+    session that spent past the end of the budget is the last one the run gets,
+    whether the clamp put the shortfall back or it ended holding it. No peer can
+    lift it out, because a seat that is out is not a gift target, so this is the
+    same answer at every round after the first time it is given.
 
     A stalled run is refused whatever its balance; callers ask stalled() to say
     which of the two stopped it.
     """
-    if stalled(meter):
-        return False
-    if meter["remaining"] > 0:
-        return True
-    if CLAMP_NEGATIVE:
-        # Nothing here is negative - the clamp ran at the end of every session,
-        # penalties are taken from max(remaining, 0), and a gift only adds - so
-        # this is a run resting on exactly zero with no peer having lifted it.
-        return False
-    if meter["remaining"] <= -OVERDRAFT:
-        return False
-    # A record without woke_at cannot say, and the safe reading of "cannot say"
-    # is that the run already had its one look: never spend on a maybe.
-    return not any(s.get("woke_at", 0) <= 0 for s in meter["sessions"])
+    return not stalled(meter) and not spent_out(meter)
 
 
 def start(config: Path | None = None) -> Callable:
@@ -2514,6 +2665,29 @@ def drive(run: str, create: Callable, prepare: Callable | None = None) -> dict |
     return run_once(run, create)
 
 
+def catch_signals() -> None:
+    """Route SIGINT and SIGTERM into STOPPING, once. See STOPPING.
+
+    The first signal asks; the second is the ordinary hard stop, because the
+    handler puts the default disposition back before it returns. So an operator
+    who has decided not to wait for the turn in flight is never held by this,
+    and one who presses out of habit does not lose a session to it.
+
+    Called from a CLI rather than at import: this module is imported by the
+    check suite, which installs no handlers of its own and would otherwise
+    inherit these.
+    """
+    def stop(signum: int, frame: Any) -> None:
+        global STOPPING
+        signal.signal(signum, signal.default_int_handler
+                      if signum == signal.SIGINT else signal.SIG_DFL)
+        STOPPING = True
+        print("\nstopping after this turn; again to abandon it", file=sys.stderr)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+
 def run_sessions(run: str, create: Callable, count: int) -> int:
     """Run up to `count` sessions back to back. Returns the exit status.
 
@@ -2523,6 +2697,11 @@ def run_sessions(run: str, create: Callable, count: int) -> int:
     """
     ran = 0
     for _ in range(count):
+        if STOPPING:
+            # Before the container, so a stop that lands between sessions builds
+            # no world at all rather than one that wakes and stops at turn one.
+            print(f"stopping after {ran} of {count} sessions", file=sys.stderr)
+            break
         try:
             trace = drive(run, create)
         except (subprocess.CalledProcessError, OSError, WorldError) as e:
@@ -2615,7 +2794,9 @@ def main(argv: list[str] | None = None) -> int:
     # Which file set the tunables is the one thing about them the trace cannot
     # record: a run reading no config and one reading a config of every default
     # are the same session.
-    return run_sessions(a.run_id, start(a.config), a.sessions)
+    create = start(a.config)
+    catch_signals()
+    return run_sessions(a.run_id, create, a.sessions)
 
 
 if __name__ == "__main__":

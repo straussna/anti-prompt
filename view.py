@@ -491,10 +491,9 @@ def cohort_sessions(c: dict) -> list[dict]:
     One session per run per round is the only thing run_round holds to by
     construction, so it is what the round is read back out of: sessions in start
     order, cut wherever a run would take a second turn in the same round. A run
-    with nothing left sits the round out and stays at the table, and its next
-    session lands in the round after - which is why the session index is not the
-    round, and why counting sessions would drift the first time a seat is gifted
-    back into one.
+    that drops out simply stops appearing, and the rounds the rest go on taking
+    are still one apiece - which is why counting one run's sessions would say
+    nothing about which round the cohort is in.
 
     The number is a cohort-lifetime round. A member driven on its own between
     rounds takes a round of its own here, and cohort.py's console starts again
@@ -570,6 +569,17 @@ def seat_row(seat: str | None, run: str, rows: list[dict], rnd: int) -> dict:
     live = live_index(run)
     turns = live_turns(run, live, meter) if live is not None else []
     mine = [r for r in rows if r["run"] == run]
+    # Not having acted in the round yet is two different things, and the round
+    # has to be over before they can be told apart. The order rotates, so for
+    # most of a round some seats have simply not been reached; a seat that acted
+    # in the round before and not in this one is one of those until the cohort
+    # moves on, and only then has it been asked and passed. Which is why this
+    # asks nothing about budget: what stops a run is admits(), and admits()
+    # reads config that only start() loads - from here it would answer for the
+    # defaults rather than for the run, and say a finished run is still coming.
+    # The balance is on the tile beside this, which is the honest way to show a
+    # seat that has nothing left.
+    pending = live is None and (mine[-1]["round"] if mine else 0) == rnd - 1
     return {
         "seat": seat, "run": run,
         "n": meter.get("remaining"), "initial": meter.get("initial"),
@@ -582,6 +592,7 @@ def seat_row(seat: str | None, run: str, rows: list[dict], rnd: int) -> dict:
         "committed": len(sessions),
         "round": mine[-1]["round"] if mine else 0,
         "acted": bool(mine and mine[-1]["round"] == rnd) or live is not None,
+        "pending": pending,
         "spent": (meter.get("initial") or 0) - (meter.get("remaining") or 0),
         "spent_this_round": sum(r["trace"]["spent"] for r in mine if r["round"] == rnd)
                             + (meter.get("remaining", 0) - turns[-1]["balance"] if turns else 0),
@@ -601,6 +612,7 @@ def seat_row(seat: str | None, run: str, rows: list[dict], rnd: int) -> dict:
         "given": meter.get("given", 0), "received": meter.get("received", 0),
         "penalised": meter.get("penalised", 0),
         "message_penalised": meter.get("message_penalised", 0),
+        "gift_penalised": meter.get("gift_penalised", 0),
         "forgiven": meter.get("forgiven", 0),
         "gift": standing_gift(run, latest),
     }
@@ -860,7 +872,7 @@ def run_view(run: str) -> dict:
         "refused": len(analyze.refused_turns_of(t)),
         "fallback": len(analyze.fallback_turns_of(t)),
         "posted": t.get("posted"), "penalised": t.get("penalised") or 0,
-        "messages": t.get("messages") or {},
+        "messages": t.get("messages") or {}, "gift": t.get("gift") or {},
         "forgiven": t.get("forgiven") or 0,
         "provenance": t.get("provenance") or {},
         "drift": t.get("provenance_drift") or [],
@@ -877,7 +889,7 @@ def run_view(run: str) -> dict:
             "duration_s": None,
             "refused": len([t for t in turns if t["stop_details"]]),
             "fallback": len([t for t in turns if t["served_by_fallback"]]),
-            "posted": None, "penalised": 0, "messages": {}, "forgiven": 0,
+            "posted": None, "penalised": 0, "messages": {}, "gift": {}, "forgiven": 0,
             "provenance": {}, "drift": [], "live": True,
         })
     seat, seen = wake.seating(run, meter)
@@ -919,7 +931,7 @@ def session_view(run: str, index: int, since: int = 0) -> dict | None:
             "missing_tools": trace.get("missing_tools") or [],
             "n_fits": trace.get("n_fits"), "read_n": trace.get("read_n"),
             "posted": trace.get("posted"), "penalised": trace.get("penalised") or 0,
-            "messages": trace.get("messages") or {},
+            "messages": trace.get("messages") or {}, "gift": trace.get("gift") or {},
             "forgiven": trace.get("forgiven") or 0,
         }
         if since == 0:
@@ -938,7 +950,7 @@ def session_view(run: str, index: int, since: int = 0) -> dict | None:
             "opening": {"command": wake.OPENING, "result": None},
             "series_before": meter.get("series") or [], "series_after": [],
             "missing_tools": [], "n_fits": None, "read_n": None,
-            "posted": None, "penalised": 0, "messages": {}, "forgiven": 0,
+            "posted": None, "penalised": 0, "messages": {}, "gift": {}, "forgiven": 0,
         }
     out["turns"] = [t for t in turns if (t["turn"] or 0) > since]
     out["total_turns"] = len(turns)
@@ -967,6 +979,7 @@ def session_changes(run: str, index: int) -> dict[str, list[str]]:
 
 PAGE = """<!doctype html>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ClaudeSandbox</title>
 <style>
 /* Dark only, and low contrast on purpose: this is a page left open beside a run
@@ -986,9 +999,9 @@ PAGE = """<!doctype html>
   --r:10px;
 }
 * { box-sizing:border-box; }
-html { color-scheme:dark; }
-body { margin:0; background:var(--bg); color:var(--ink);
-       font:400 15px/1.65 var(--sans); -webkit-font-smoothing:antialiased; }
+html { color-scheme:dark; height:100%; }
+body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+       font:400 14px/1.5 var(--sans); -webkit-font-smoothing:antialiased; }
 ::selection { background:rgba(127,155,176,.28); }
 ::-webkit-scrollbar { width:11px; height:11px; }
 ::-webkit-scrollbar-track { background:transparent; }
@@ -996,13 +1009,13 @@ body { margin:0; background:var(--bg); color:var(--ink);
                             border:3px solid transparent; background-clip:content-box; }
 ::-webkit-scrollbar-thumb:hover { background:var(--faint); background-clip:content-box; }
 
-h2 { margin:30px 0 13px; font:600 11.5px/1 var(--sans); letter-spacing:.16em;
+h2 { margin:16px 0 8px; font:600 11.5px/1 var(--sans); letter-spacing:.16em;
      text-transform:uppercase; color:var(--faint); }
 .num { font-family:var(--mono); font-variant-numeric:tabular-nums; }
-.note { color:var(--faint); font-size:13px; margin:0; }
-.empty { color:var(--faint); padding:70px 0; text-align:center; }
+.note { color:var(--faint); font-size:12.5px; margin:0; }
+.empty { color:var(--faint); padding:28px 0; text-align:center; }
 .panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--r);
-         padding:17px 19px; }
+         padding:12px 14px; }
 .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(205px,1fr)); gap:16px 22px; }
 .kv .k { color:var(--faint); font:500 11.5px/1 var(--sans); letter-spacing:.09em;
          text-transform:uppercase; }
@@ -1021,15 +1034,24 @@ h2 { margin:30px 0 13px; font:600 11.5px/1 var(--sans); letter-spacing:.16em;
    the balances and the ledger keep the plain tag: they are the world, not this
    run's doing. */
 .tag.board { color:var(--accent); border-color:rgba(127,155,176,.38); background:rgba(127,155,176,.08); }
-.bar { height:3px; background:var(--line); border-radius:2px; margin:9px 0 8px; overflow:hidden; }
+.bar { height:3px; background:var(--line); border-radius:2px; margin:7px 0 6px; overflow:hidden; }
 .bar i { display:block; height:100%; background:var(--accent); transition:width .3s ease; }
 .bar.over i { background:var(--bad); }
 
 /* --- the header, which every tab is read under --- */
-#page { max-width:1680px; margin:0 auto; padding:0 28px 90px; }
-#top { position:sticky; top:0; z-index:5; background:var(--bg);
-       border-bottom:1px solid var(--line); padding:16px 0 0; }
-.who { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+/* The page is the window: a column of a fixed header over one region that takes
+   what is left. Every pane sizes itself against that region rather than against
+   the viewport, so the only scrollbar on screen belongs to whatever is being
+   read. */
+#page { height:100dvh; display:flex; flex-direction:column; padding:0 20px; }
+/* Unfolded, the header is as tall as the round it is describing: a long ledger
+   or a seat carrying every penalty at once would otherwise leave the transcript
+   a few lines. It is capped at half the window and scrolls inside that, so what
+   is being read always has the other half. */
+#top { flex:0 0 auto; background:var(--bg); border-bottom:1px solid var(--line);
+       padding:12px 0 0; max-height:48dvh; overflow-y:auto; overflow-x:hidden; }
+#top.compact { max-height:none; overflow:visible; }
+.who { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
 .who b { font:600 15px/1 var(--mono); letter-spacing:.01em; }
 .who .sub { color:var(--faint); font-size:12.5px; }
 .picks { display:flex; gap:6px; flex-wrap:wrap; }
@@ -1041,65 +1063,139 @@ h2 { margin:30px 0 13px; font:600 11.5px/1 var(--sans); letter-spacing:.16em;
 .filt.on { color:var(--ink); border-color:var(--accent); background:rgba(127,155,176,.14); }
 .filt em { font-style:normal; color:var(--faint); margin-left:5px; }
 
-.board { display:grid; grid-template-columns:1fr 260px; gap:20px; align-items:start; }
+.fold { margin-left:auto; padding:3px 10px; border:1px solid var(--line2); border-radius:999px;
+        cursor:pointer; background:transparent; color:var(--faint);
+        font:500 11.5px/1.5 var(--sans); letter-spacing:.02em; }
+.fold:hover { color:var(--ink); border-color:var(--faint); }
+
+.board { display:grid; grid-template-columns:1fr 230px; gap:16px; align-items:start; }
 .seats { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:1px;
          background:var(--line); border:1px solid var(--line); border-radius:var(--r);
          overflow:hidden; }
-.tile { background:var(--panel); padding:12px 14px 13px; }
-.tile.out { background:var(--sunk); }
+.tile { background:var(--panel); padding:8px 11px 9px; }
+/* Named for the seat rather than for the round, because `out` is already the
+   pre a command's output is read in and a tile is not one. */
+.tile.idle { background:var(--sunk); }
 .tile .k { display:flex; justify-content:space-between; align-items:baseline; gap:8px;
            color:var(--faint); font:500 11px/1 var(--sans); letter-spacing:.11em;
            text-transform:uppercase; }
 /* A run id is a name rather than a label, so it keeps the letters it was given. */
 .tile .k b { color:var(--dim); font:600 11px/1 var(--mono); letter-spacing:.02em;
              text-transform:none; }
-.tile .v { margin-top:7px; font:400 21px/1 var(--mono); font-variant-numeric:tabular-nums; }
+.tile .v { margin-top:5px; font:400 19px/1 var(--mono); font-variant-numeric:tabular-nums; }
 .tile .v.neg { color:var(--bad); }
-.tile .m { color:var(--faint); font-size:12px; display:flex; gap:9px; flex-wrap:wrap;
-           align-items:center; margin-top:7px; }
-.tile .m + .m { margin-top:6px; }
+/* One wrapping row, so a seat carrying a gift and a halt is no taller than a
+   seat carrying neither. */
+.tile .m { color:var(--faint); font-size:12px; display:flex; gap:5px 9px; flex-wrap:wrap;
+           align-items:center; margin-top:5px; }
+.tile .m i { font-style:normal; color:var(--line2); }
+
+/* Collapsed, the header is the balances and the tabs: the rows under each
+   number are the round's detail, and a reader watching a transcript is not
+   reading them. */
+#top.compact .m, #top.compact #gwrap, #top.compact .bar { display:none; }
+#top.compact .board { grid-template-columns:1fr; }
+#top.compact .tile { padding:7px 11px 8px; }
+#top.compact .tile .v { margin-top:4px; font-size:15px; }
+#top.compact .who { margin-bottom:8px; }
+
 .gbox { border:1px solid var(--line); border-radius:var(--r); background:var(--panel);
-        padding:12px 14px; }
-.gbox table { margin-top:8px; }
-.gbox td { padding:4px 12px 4px 0; border:0; }
-#tabs { display:flex; gap:2px; margin-top:16px; }
-.tab { padding:9px 16px 11px; border:0; border-bottom:2px solid transparent; cursor:pointer;
+        padding:10px 12px; }
+/* A cohort that has been trading for a while has a ledger longer than the
+   seats beside it; it scrolls rather than setting how tall the header is. */
+.gbox .led { max-height:150px; overflow-y:auto; margin-top:6px; }
+.gbox td { padding:3px 12px 3px 0; border:0; }
+#tabs { display:flex; gap:2px; margin-top:10px; }
+.tab { padding:8px 15px 9px; border:0; border-bottom:2px solid transparent; cursor:pointer;
        background:transparent; color:var(--faint); font:500 13.5px/1 var(--sans);
        letter-spacing:.02em; }
 .tab:hover { color:var(--ink); }
 .tab.on { color:var(--ink); border-bottom-color:var(--accent); }
 .tab em { font-style:normal; color:var(--faint); margin-left:7px; font-size:12px; }
-#body { padding-top:8px; }
+/* What is left of the window after the header. Nothing inside it may grow the
+   page: a pane that wants more room scrolls itself. */
+#body { flex:1 1 auto; min-height:0; overflow:hidden; padding-top:8px;
+        display:flex; flex-direction:column; }
+#body > * { min-height:0; }
+/* A tab that fills the region: its own column, with one child taking the slack. */
+.fill { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
 
-/* --- the message log --- */
-.round { display:flex; align-items:center; gap:12px; margin:26px 0 12px; color:var(--faint);
+/* --- the message log, read as the chat it is --- */
+.round { display:flex; align-items:center; gap:12px; margin:14px 0 8px; color:var(--faint);
          font:500 11.5px/1 var(--sans); letter-spacing:.16em; text-transform:uppercase; }
 .round i { flex:1; height:1px; background:var(--line); }
-.ev { border:1px solid var(--line); border-radius:var(--r); background:var(--panel);
-      padding:13px 16px; margin-bottom:9px; }
-.ev.tip { background:var(--sunk); border-style:dashed; }
-.ev.gone { opacity:.6; }
-.evh { display:flex; gap:10px; flex-wrap:wrap; align-items:center;
-       color:var(--faint); font-size:12.5px; }
-.evh .who2 { font:400 13.5px/1 var(--mono); color:var(--ink); }
-.evh .who2 s { color:var(--faint); text-decoration:none; margin:0 5px; }
-.ev pre { margin:9px 0 0; padding:10px 13px; white-space:pre-wrap; color:var(--dim);
-          font:400 13.5px/1.55 var(--mono); background:var(--sunk); border-radius:8px;
-          max-height:20em; overflow:auto; }
+.chat { flex:1 1 auto; min-height:0; display:grid; grid-template-columns:262px minmax(0,1fr);
+        gap:12px; align-items:stretch; }
+.chat.narrow { grid-template-columns:44px minmax(0,1fr); }
+.chat.narrow .pair .p, .chat.narrow .pair .t em { display:none; }
+.chat.narrow .pair { padding:9px 6px; text-align:center; }
+.chat.narrow .pair .t { justify-content:center; }
+.pairs { border:1px solid var(--line); border-radius:var(--r); background:var(--panel);
+         min-height:0; overflow-y:auto; }
+.pair { display:block; width:100%; text-align:left; padding:9px 13px; cursor:pointer;
+        background:transparent; border:0; border-bottom:1px solid var(--line);
+        font:400 14px/1.5 var(--sans); transition:background .12s ease; }
+.pair:last-child { border-bottom:0; }
+.pair:hover { background:var(--raise); }
+.pair.on { background:var(--raise); box-shadow:inset 2px 0 0 var(--accent); }
+.pair.mute { opacity:.5; }
+.pair .t { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+.pair .t .nm { font:400 13.5px/1.3 var(--mono); color:var(--ink); }
+.pair .t em { font-style:normal; font:400 11.5px/1.3 var(--sans); color:var(--faint); }
+.pair .p { margin-top:4px; font-size:12.5px; color:var(--faint);
+           overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+.thread { border:1px solid var(--line); border-radius:var(--r); background:var(--panel);
+          min-width:0; min-height:0; display:flex; flex-direction:column; }
+.thead { padding:9px 14px; border-bottom:1px solid var(--line);
+         display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+.thead .nm { font:400 14px/1.4 var(--mono); }
+#thread { flex:1 1 auto; min-height:0; overflow-y:auto; overflow-anchor:none;
+          padding:2px 14px 12px; }
+#thread .round:first-child { margin-top:12px; }
+/* A log, not a chat: a message takes the width it is given, and which way it
+   went is said in its header rather than by which side it sits on. */
+.msg { margin-top:8px; }
+.msg .mh { display:flex; gap:9px; align-items:baseline; flex-wrap:wrap; margin-bottom:3px;
+           color:var(--faint); font-size:12px; }
+.msg .mh b { font:400 13px/1.4 var(--mono); font-weight:400; }
+.msg .bub { border:1px solid var(--line2); border-radius:8px;
+            background:var(--raise); padding:7px 11px; }
+.msg.r .bub { border-left:2px solid var(--line2); }
+.msg.tip .bub { border-style:dashed; background:var(--sunk); }
+.msg.same .bub { opacity:.62; }
+.msg .bub pre { margin:0; white-space:pre-wrap; color:var(--ink);
+                font:400 13px/1.5 var(--mono); max-height:26em; overflow:auto; }
+.msg .bub details { margin-top:7px; }
+.msg .bub summary { cursor:pointer; color:var(--faint); font-size:12px; }
+.msg .bub details pre { margin-top:6px; padding:7px 10px; background:var(--sunk);
+                        border-radius:8px; color:var(--dim); }
+.msg .ft { margin-top:3px; color:var(--faint); font-size:12px; }
+.sys { margin-top:10px; text-align:center; color:var(--faint); font-size:12.5px; }
+.sys b { font:400 12.5px/1.5 var(--mono); font-weight:400; }
 
 /* --- the boards and the private stores, side by side --- */
-.cols { display:grid; gap:14px; overflow-x:auto; padding-bottom:8px;
-        align-items:start; }
+/* The listing is an index and stays a column a seat; what a file says is read
+   below it, across the whole window, in as many columns as there are files
+   open. A file's contents are the reason the tab exists, so they get the room. */
+.trees { flex:1 1 auto; min-height:0; overflow-y:auto; padding-bottom:8px; }
+/* Both grids wrap rather than run off the side: a listing too narrow to read is
+   no better than one that is not on screen. */
+.cols { display:grid; gap:12px; align-items:start;
+        grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr)); }
 .col { border:1px solid var(--line); border-radius:var(--r); background:var(--panel);
-       min-width:290px; }
-.col .h { padding:12px 15px; border-bottom:1px solid var(--line);
+       min-width:0; }
+.col .h { padding:9px 13px; border-bottom:1px solid var(--line);
           display:flex; gap:9px; align-items:baseline; flex-wrap:wrap; }
 .col .h b { font:600 14px/1 var(--mono); }
 .col .h span { color:var(--faint); font-size:12.5px; }
-.col .b { padding:4px 15px 12px; }
+.col .b { padding:2px 13px 8px; }
+.bodies { display:grid; gap:12px; margin-top:12px; align-items:start;
+          grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr)); }
+.bodies .col .b { padding:10px 13px 12px; }
 
 table { border-collapse:collapse; width:100%; font:400 13px/1 var(--mono); }
-td, th { text-align:left; padding:9px 14px 9px 0; border-bottom:1px solid var(--line); }
+td, th { text-align:left; padding:6px 12px 6px 0; border-bottom:1px solid var(--line); }
 tr:last-child td { border-bottom:0; }
 th { color:var(--faint); font:500 11.5px/1 var(--sans); letter-spacing:.11em; text-transform:uppercase; }
 tr.file { cursor:pointer; transition:background .12s ease; }
@@ -1110,8 +1206,10 @@ td.sz { color:var(--faint); font-variant-numeric:tabular-nums; text-align:right;
 td.md, td.kd { color:var(--faint); width:1%; white-space:nowrap; }
 
 /* --- the transcript --- */
-.strip { display:flex; flex-wrap:wrap; gap:6px; }
-.chip { padding:6px 12px; border:1px solid var(--line2); border-radius:7px; cursor:pointer;
+.strip { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.strip .lbl { color:var(--faint); font:600 11.5px/1 var(--sans); letter-spacing:.16em;
+              text-transform:uppercase; width:56px; flex:0 0 auto; }
+.chip { padding:5px 10px; border:1px solid var(--line2); border-radius:7px; cursor:pointer;
         background:var(--panel); color:var(--dim); font:400 13px/1 var(--mono);
         transition:color .12s ease, border-color .12s ease, background .12s ease; }
 .chip:hover { color:var(--ink); border-color:var(--faint); }
@@ -1120,23 +1218,26 @@ td.md, td.kd { color:var(--faint); width:1%; white-space:nowrap; }
 .chip.halt { color:var(--warn); border-color:rgba(194,160,107,.45); }
 .chip.off { opacity:.4; cursor:default; }
 .txbar { display:flex; justify-content:space-between; align-items:center; gap:16px;
-         margin-bottom:11px; }
-#tx { background:var(--panel); border:1px solid var(--line); border-radius:var(--r);
-      max-height:62vh; overflow-y:auto; overflow-anchor:none; }
-.turn { padding:17px 21px; border-top:1px solid var(--line); }
+         margin-bottom:8px; }
+#tx { flex:1 1 auto; min-height:0; background:var(--panel); border:1px solid var(--line);
+      border-radius:var(--r); overflow-y:auto; overflow-anchor:none; }
+.turn { padding:11px 15px; border-top:1px solid var(--line); }
 .turn:first-child { border-top:0; }
 .th { color:var(--faint); font-size:12.5px; display:flex; gap:10px; flex-wrap:wrap;
-      align-items:center; margin-bottom:10px; }
+      align-items:center; margin-bottom:7px; }
 .th .num { font-size:12.5px; color:var(--dim); }
-.say { white-space:pre-wrap; margin:0; color:var(--ink); }
-.think { white-space:pre-wrap; margin:0 0 11px; color:var(--faint); font-style:italic;
-         font-size:14px; border-left:1px solid var(--line2); padding-left:13px; }
-.cmd { margin:14px 0 0; color:var(--accent); white-space:pre-wrap; font:400 13.5px/1.6 var(--mono); }
+/* Prose is read a line at a time, so it keeps a measure however wide the window
+   is. Everything the agent ran, wrote, or was shown takes the whole of it. */
+.say { white-space:pre-wrap; margin:0; color:var(--ink); max-width:110ch; }
+.think { white-space:pre-wrap; margin:0 0 9px; color:var(--faint); font-style:italic;
+         font-size:13.5px; border-left:1px solid var(--line2); padding-left:11px;
+         max-width:110ch; }
+.cmd { margin:9px 0 0; color:var(--accent); white-space:pre-wrap; font:400 13px/1.55 var(--mono); }
 .cmd::before { content:"$ "; color:var(--faint); }
-.out { margin:7px 0 0; padding:11px 14px; white-space:pre-wrap; color:var(--dim);
-       font:400 13.5px/1.55 var(--mono); background:var(--sunk); border-radius:8px;
-       max-height:22em; overflow:auto; }
-.pend { margin:7px 0 0; padding:10px 14px; color:var(--warn); font-size:13.5px;
+.out { margin:5px 0 0; padding:8px 11px; white-space:pre-wrap; color:var(--dim);
+       font:400 13px/1.5 var(--mono); background:var(--sunk); border-radius:8px;
+       max-height:26em; overflow:auto; }
+.pend { margin:5px 0 0; padding:8px 11px; color:var(--warn); font-size:13.5px;
         background:rgba(194,160,107,.07); border-radius:8px; }
 .diff .a { color:var(--live); } .diff .d { color:var(--bad); } .diff .h { color:var(--faint); }
 .tail { color:var(--faint); font-size:12.5px; cursor:pointer; user-select:none;
@@ -1148,12 +1249,14 @@ td.md, td.kd { color:var(--faint); width:1%; white-space:nowrap; }
         border:1px solid var(--line2); background:var(--raise); color:var(--dim);
         font:500 12px/1.5 var(--sans); cursor:pointer; }
 .jump:hover { color:var(--ink); border-color:var(--faint); }
-.txwrap { position:relative; }
+.txwrap { position:relative; flex:1 1 auto; min-height:0; display:flex;
+          flex-direction:column; }
 </style>
 <div id="page">
   <header id="top">
     <div class="who"><b>ClaudeSandbox</b><span class="sub" id="whosub"></span>
-      <div class="picks" id="picks"></div></div>
+      <div class="picks" id="picks"></div>
+      <button class="fold" id="fold"></button></div>
     <div class="board"><div class="seats" id="seats"></div>
       <div id="gwrap"></div></div>
     <nav id="tabs"></nav>
@@ -1179,14 +1282,58 @@ const outboxWhy = (m) => {
 const TABS = [["messages", "messages"], ["board", "boards"],
               ["private", "private"], ["run", "transcripts"]];
 
+// What the page is folded down to is the reader's, not the run's, so it is kept
+// where a reload can find it again.
+const held = (k, dflt) => { try { const v = localStorage.getItem(k);
+  return v == null ? dflt : v === "1"; } catch (e) { return dflt; } };
+const hold = (k, v) => { try { localStorage.setItem(k, v ? "1" : "0"); } catch (e) {} };
+
+// --- where the reader left each box --------------------------------------
+
+// How far a box is from its end, in pixels.
+function behind(b) { return b.scrollHeight - b.scrollTop - b.clientHeight; }
+
+// At the end means there is something to scroll and the reader is against the
+// bottom of it. A box with nothing to scroll is not at its end, so filling one
+// carries the reader nowhere.
+const NEAR = 40;
+const atEnd = (b) => b.scrollHeight > b.clientHeight && behind(b) < NEAR;
+
+// Every box the page can be scrolled in. A pane is drawn by replacing its
+// nodes, and the new nodes carry none of the scroll the old ones had.
+const BOXES = "#tx, #thread, .pairs, .trees, .led, .out, .bub pre";
+const boxesIn = (el) =>
+  (el.matches(BOXES) ? [el] : []).concat([...el.querySelectorAll(BOXES)]);
+
+// Write `html` into `el`, leaving every box inside it where its reader had it:
+// one against the end stays against the end as content arrives, and every other
+// one keeps the offset it was read at. Boxes are matched across the write by
+// the order they are written in, so a pane that grows at its end hands each box
+// back its own place.
+function redraw(el, html) {
+  const was = boxesIn(el).map(b => [b.scrollTop, b.scrollLeft, atEnd(b)]);
+  el.innerHTML = html;
+  boxesIn(el).forEach((b, i) => {
+    const had = was[i];
+    if (!had) return;
+    b.scrollTop = had[2] ? b.scrollHeight : had[0];
+    b.scrollLeft = had[1];
+  });
+}
+
 const S = { cohorts: [], cohort: null, head: null, tab: "messages",
             // The message log is append-only, so what is held is extended
             // rather than re-fetched; the tip is whatever is ahead of it.
-            msgs: [], tips: [], msgn: 0, standing: false,
+            msgs: [], tips: [], msgn: 0, standing: false, pair: null,
             tree: { board: null, private: null }, open: {}, body: {},
             // One agent's transcript, and how many of its turns are drawn.
             run: null, detail: null, session: null, view: null,
             since: 0, source: null, drawn: 0, tail: true,
+            // Where the transcript is being read, held here rather than in the
+            // pane, because the pane is replaced under it.
+            txtop: 0, txend: false,
+            // How much of the header, and of the thread list, is shown.
+            compact: held("compact", true), rail: held("rail", false),
             poll: 1500, stale: 180 };
 
 const PENDING = "output arrives when the session ends";
@@ -1259,7 +1406,7 @@ function renderPicks() {
 function pickCohort(name) {
   if (name === S.cohort) return;
   S.cohort = name;
-  S.msgs = []; S.tips = []; S.msgn = 0;
+  S.msgs = []; S.tips = []; S.msgn = 0; S.pair = null;
   S.tree = { board: null, private: null }; S.open = {}; S.body = {};
   S.run = null; S.detail = null; S.session = null; S.view = null; S.drawn = 0;
   renderPicks();
@@ -1279,35 +1426,45 @@ function tileHtml(s, i) {
       ? `<span class="tag live"><i class="dot"></i>s${s.live} \\u00b7 ${s.live_turns}t \\u00b7 derived</span>`
     : s.live != null
       ? `<span class="tag warn" title="no trace was ever written for it">s${s.live} unfinished \\u00b7 ${ago(s.live_age)}</span>`
+    : s.pending
+      ? `<span class="tag" title="the round is still going and it has not acted in it; the order rotates, so a seat it has not reached yet looks no different from one it has">not yet this round</span>`
     : !s.acted
-      ? `<span class="tag" title="out of budget, or it refused; a peer can gift it back in">sat this round out</span>`
+      ? `<span class="tag" title="nothing left to spend, or it refused its last sessions running; either way it is off the table">out of the run</span>`
       : `<span>s${s.committed} committed</span>`;
-  return `<div class="tile ${s.acted ? "" : "out"}">
+  return `<div class="tile ${s.acted || s.pending ? "" : "idle"}">
     <div class="k"><span style="color:${inkOf(i)}">${s.seat == null ? "run" : "n" + esc(s.seat)}</span>
       <b>${esc(s.run)}</b></div>
     <div class="v ${n < 0 ? "neg" : ""}">${num(n)}</div>
     <div class="bar ${n < 0 ? "over" : ""}"><i style="width:${(left * 100).toFixed(1)}%"></i></div>
-    <div class="m">${state}</div>
-    <div class="m"><span title="spent this round">round ${num(s.spent_this_round)}</span>
+    <div class="m">${state}<i>|</i>
+      <span title="spent this round">round ${num(s.spent_this_round)}</span>
       <span title="spent in all">of ${num(s.spent)}</span>
       ${s.posted === false ? `<span class="tag bad" title="its board held nothing new">did not post</span>` : ""}
-      ${s.messaged === false ? `<span class="tag bad" title="its outbox did not say one new thing to one agent">said nothing new</span>` : ""}</div>
-    ${(s.given || s.received || s.penalised || s.message_penalised || s.forgiven || gift) ? `<div class="m">
-      ${s.given ? `<span title="given away">\\u2192 ${num(s.given)}</span>` : ""}
-      ${s.received ? `<span title="given to it">\\u2190 ${num(s.received)}</span>` : ""}
-      ${s.penalised ? `<span title="taken for a session that did not post">\\u2212 ${num(s.penalised)}</span>` : ""}
-      ${s.message_penalised ? `<span title="taken for an outbox that said no one new thing">\\u2212 ${num(s.message_penalised)}</span>` : ""}
-      ${s.forgiven ? `<span title="clamped back to zero; its world never says so"
-        >clamped ${num(s.forgiven)}</span>` : ""}${gift}</div>` : ""}
-    ${(s.halted || s.drift.length) ? `<div class="m">
-      ${s.halted ? `<span class="tag bad">${esc(s.stop)}</span>` : ""}
-      ${s.drift.length ? `<span class="tag warn" title="${esc(s.drift.join("; "))}">drift</span>` : ""}</div>` : ""}
+      ${s.messaged === false ? `<span class="tag bad" title="its outbox did not say one new thing to one agent">said nothing new</span>` : ""}
+      ${(s.given || s.received || s.penalised || s.message_penalised || s.gift_penalised || s.forgiven || gift) ? `<i>|</i>
+        ${s.given ? `<span title="given away">\\u2192 ${num(s.given)}</span>` : ""}
+        ${s.received ? `<span title="given to it">\\u2190 ${num(s.received)}</span>` : ""}
+        ${s.gift_penalised ? `<span title="taken for a session that made no gift of its own">\\u2212 ${num(s.gift_penalised)}</span>` : ""}
+        ${s.penalised ? `<span title="taken for a session that did not post">\\u2212 ${num(s.penalised)}</span>` : ""}
+        ${s.message_penalised ? `<span title="taken for an outbox that said no one new thing">\\u2212 ${num(s.message_penalised)}</span>` : ""}
+        ${s.forgiven ? `<span title="clamped back to zero; its world never says so"
+          >clamped ${num(s.forgiven)}</span>` : ""}${gift}` : ""}
+      ${(s.halted || s.drift.length) ? `<i>|</i>
+        ${s.halted ? `<span class="tag bad">${esc(s.stop)}</span>` : ""}
+        ${s.drift.length ? `<span class="tag warn" title="${esc(s.drift.join("; "))}">drift</span>` : ""}` : ""}</div>
   </div>`;
+}
+
+function renderFold() {
+  document.getElementById("top").classList.toggle("compact", S.compact);
+  document.getElementById("fold").textContent =
+    S.compact ? "\\u25be the round" : "\\u25b4 the round";
 }
 
 function renderHeader() {
   const h = S.head;
   if (!h) return;
+  renderFold();
   document.getElementById("whosub").innerHTML =
     `${h.seats.length} ${h.seated ? "seats" : "runs"} \\u00b7 round ${h.round}` +
     (h.model ? ` \\u00b7 ${esc(h.model)}` : "") +
@@ -1319,10 +1476,11 @@ function renderHeader() {
   const rows = h.ledger.map(([giver, taker, amount]) => `<tr>
       <td class="num">${esc(giver)} ${esc(taker)} ${num(amount)}</td>
       <td class="note">${esc(seatName(giver) || "")} \\u2192 ${esc(seatName(taker) || "")}</td></tr>`).join("");
-  document.getElementById("gwrap").innerHTML = !h.seated ? "" : `<div class="gbox">
+  redraw(document.getElementById("gwrap"), !h.seated ? "" : `<div class="gbox">
     <div class="kv"><div class="k">g \\u00b7 the gift ledger</div></div>
-    ${rows ? `<table>${rows}</table>` : `<div class="note" style="margin-top:8px">no gift has moved</div>`}
-    <div style="margin-top:10px">${overlay(h.seats)}</div></div>`;
+    ${rows ? `<div class="led"><table>${rows}</table></div>`
+           : `<div class="note" style="margin-top:8px">no gift has moved</div>`}
+    <div style="margin-top:10px">${overlay(h.seats)}</div></div>`);
   document.getElementById("tabs").innerHTML = TABS.map(([key, label]) => {
     const off = key === "messages" && (!h.posts || h.seats.length < 2);
     return `<button class="tab ${S.tab === key ? "on" : ""}" data-t="${key}">${label}${
@@ -1338,37 +1496,111 @@ function renderHeader() {
 
 // --- the message log -----------------------------------------------------
 
-function evHtml(e) {
-  const from = `${e.from_seat == null ? e.from_run : e.from_seat}`;
-  const to = e.to_seat == null ? "?" : e.to_seat;
-  const gift = e.kind === "gift";
+// A thread is the pair of seats a channel runs between: out/1 written by seat 0
+// and out/0 written by seat 1 are the two directions of one conversation, so
+// events are keyed on the pair rather than on the sender.
+const pairKey = (a, b) => [a, b].sort((x, y) => Number(x) - Number(y)).join("\\u00b7");
+
+const seatInk = (seat) => {
+  const i = (S.head ? S.head.seats : []).findIndex(s => String(s.seat) === String(seat));
+  return i < 0 ? "var(--ink)" : inkOf(i);
+};
+
+const seatTag = (seat) => `<b style="color:${seatInk(seat)}">n${esc(seat)}</b>`;
+
+// Every pair of the cohort, whether or not anything has passed between them: two
+// agents that have never addressed each other are a fact about the round, and a
+// thread that only appeared once it had traffic could not be looked for.
+function threadsOf() {
+  const seats = (S.head ? S.head.seats : []).filter(s => s.seat != null);
+  const by = new Map();
+  for (let i = 0; i < seats.length; i++) {
+    for (let j = i + 1; j < seats.length; j++) {
+      by.set(pairKey(seats[i].seat, seats[j].seat),
+             { key: pairKey(seats[i].seat, seats[j].seat), a: seats[i], b: seats[j],
+               events: [], tips: [] });
+    }
+  }
+  // A path naming what is not a seat of this cohort reaches nobody, and so does
+  // a declaration that resolved to no one. Neither sits between two agents, and
+  // both are still something a sender wrote.
+  const loose = { key: "\\u2205", a: null, b: null, events: [], tips: [] };
+  const bin = (e) => (e.to_run == null ? null : by.get(pairKey(e.from_seat, e.to_seat))) || loose;
+  for (const e of S.msgs) bin(e).events.push(e);
+  for (const e of S.tips) bin(e).tips.push(e);
+  const out = [...by.values()];
+  if (loose.events.length || loose.tips.length) out.push(loose);
+  return out;
+}
+
+// An outbox left alone is delivered again every round, so the repeats are the
+// bulk of the log and say nothing new. They are off by default and counted.
+const saidIn = (t) => t.events.filter(e => S.standing || e.change !== "standing");
+
+function previewOf(t) {
+  const all = saidIn(t).concat(t.tips);
+  const e = all[all.length - 1];
+  if (!e) return "nothing addressed";
+  if (e.kind === "gift") return `gift \\u00b7 ${(e.gift || {}).amount
+    ? num(e.gift.amount) : "moved nothing"}`;
+  if (e.change === "withdrawn") return `n${e.from_seat} took back ${e.path}`;
+  return `n${e.from_seat}: ${(e.text || "").trim().split("\\n")[0] || "(empty)"}`;
+}
+
+const whenOf = (e) => e.tip ? "not traced yet" : `round ${e.round}`;
+
+function msgHtml(e, t) {
   const g = e.gift || {};
-  const tags = [
-    `<span class="tag ${e.change === "withdrawn" ? "bad"
-      : e.change === "standing" ? "" : "board"}">${e.change}</span>`,
-    gift ? (g.amount ? `<span class="tag live">moved ${num(g.amount)}</span>`
-      : `<span class="tag warn" title="${esc(g.error || "")}">moved nothing</span>`) : "",
-    e.binary ? `<span class="tag">binary</span>` : "",
-  ].join(" ");
-  const deliver = e.delivered
-    ? `<div class="note" style="margin-top:8px">\\u2192 ${esc(e.to_run)} s${e.delivered.session}
-       (round ${e.delivered.round})${e.delivered.read
-         ? ` \\u00b7 <span style="color:var(--live)">named in/${esc(e.from_seat)}</span>`
-         : ` \\u00b7 never named in/${esc(e.from_seat)}`}</div>`
-    : e.tip ? `<div class="note" style="margin-top:8px">standing now; nobody has woken to it yet</div>`
-    : gift ? "" : `<div class="note" style="margin-top:8px">not delivered yet</div>`;
-  const diff = e.diff.length ? `<pre class="diff">${e.diff.map(l =>
-    `<span class="${l[0] === "+" ? "a" : l[0] === "-" ? "d" : "h"}">${esc(l)}</span>`).join("\\n")}</pre>` : "";
-  const body = e.change === "withdrawn" ? ""
-    : diff ? diff
-    : e.text ? `<pre>${esc(e.text)}</pre>` : "";
-  return `<div class="ev ${e.tip ? "tip" : ""} ${e.change === "withdrawn" ? "gone" : ""}">
-    <div class="evh"><span class="who2">${esc(from)}<s>\\u2192</s>${gift
-        ? "g" : esc(to)}</span>
-      <span class="num">${esc(e.path)}</span>${tags}
-      <span style="margin-left:auto">${esc(e.from_run)} s${e.session == null ? "?" : e.session}${
-        e.size ? ` \\u00b7 ${num(e.size)} B` : ""}</span></div>
-    ${body}${deliver}</div>`;
+  if (e.kind === "gift") {
+    const moved = g.amount ? `moved ${num(g.amount)} to n${esc(g.seat || e.to_seat)}`
+      : `<span style="color:var(--warn)" title="${esc(g.error || "")}">moved nothing</span>`;
+    return `<div class="sys">${seatTag(e.from_seat)} ${e.change === "withdrawn"
+      ? "withdrew its gift declaration" : `declared a gift \\u00b7 ${moved}`}
+      \\u00b7 ${whenOf(e)}</div>`;
+  }
+  if (e.change === "withdrawn") {
+    return `<div class="sys">${seatTag(e.from_seat)} took back ${esc(e.path)}, and nothing
+      stands there now \\u00b7 ${whenOf(e)}</div>`;
+  }
+  const tag = e.change === "edited"
+      ? `<span class="tag board">edited</span>`
+    : e.change === "standing"
+      ? `<span class="tag" title="left in place, so it is delivered again">said again</span>` : "";
+  const diff = e.diff.length ? `<details><summary>what changed</summary><pre class="diff">${
+    e.diff.map(l => `<span class="${l[0] === "+" ? "a" : l[0] === "-" ? "d" : "h"}"
+      >${esc(l)}</span>`).join("\\n")}</pre></details>` : "";
+  const body = e.binary ? `<pre class="note">not text</pre>`
+    : e.text ? `<pre>${esc(e.text)}</pre>` : `<pre class="note">empty</pre>`;
+  const ft = e.delivered
+    ? `\\u2192 ${esc(e.to_run)} s${e.delivered.session} (round ${e.delivered.round})${
+        e.delivered.read ? ` \\u00b7 <span style="color:var(--live)">named in/${esc(e.from_seat)}</span>`
+                         : ` \\u00b7 never named in/${esc(e.from_seat)}`}`
+    : e.tip ? "standing now; nobody has woken to it yet"
+    : "not delivered yet";
+  return `<div class="msg ${!t.a || String(e.from_seat) === String(t.a.seat) ? "" : "r"}
+      ${e.tip ? "tip" : ""} ${e.change === "standing" ? "same" : ""}">
+    <div class="mh">${seatTag(e.from_seat)}
+      <span>${esc(e.from_run)} s${e.session == null ? "?" : e.session}</span>
+      <span class="num">${esc(e.path)}${e.size ? ` \\u00b7 ${num(e.size)} B` : ""}</span>${tag}</div>
+    <div class="bub">${body}${diff}</div>
+    <div class="ft">${ft}</div></div>`;
+}
+
+function threadHtml(t) {
+  let out = "", seen = null;
+  for (const e of saidIn(t)) {
+    if (e.round !== seen) { seen = e.round; out += `<div class="round">round ${e.round}<i></i></div>`; }
+    out += msgHtml(e, t);
+  }
+  if (!out) {
+    out = `<div class="empty">${t.a ? `n${esc(t.a.seat)} and n${esc(t.b.seat)} have addressed
+      nothing to each other` : "nothing has reached nobody"}</div>`;
+  }
+  if (t.tips.length) {
+    out += `<div class="round">ahead of the last trace<i></i></div>`
+         + t.tips.map(e => msgHtml(e, t)).join("");
+  }
+  return out;
 }
 
 function renderMessages() {
@@ -1381,27 +1613,57 @@ function renderMessages() {
     el.innerHTML = `<div class="empty">no outbox in this cohort's world</div>`;
     return;
   }
-  const shown = S.msgs.filter(e => S.standing || e.change !== "standing");
-  const sig = JSON.stringify([shown.length, S.standing, S.tips.map(e => [e.path, e.change, e.size])]);
+  const ts = threadsOf();
+  if (!ts.length) { el.innerHTML = `<div class="empty">no seats to address</div>`; return; }
+  // The busiest thread, so a page opened on a cohort mid-round lands on one
+  // that has something in it rather than on whichever pair sorts first.
+  if (!ts.some(t => t.key === S.pair)) {
+    S.pair = ts.reduce((a, b) => saidIn(b).length > saidIn(a).length ? b : a).key;
+  }
+  const t = ts.find(x => x.key === S.pair);
+  const sig = JSON.stringify([S.pair, S.standing, S.rail, ts.map(x => [x.key, x.events.length]),
+    S.tips.map(e => [e.from_seat, e.path, e.change, e.size])]);
   if (el.dataset.sig === sig) return;
   el.dataset.sig = sig;
-  const standing = S.msgs.length - S.msgs.filter(e => e.change !== "standing").length;
-  let out = `<div class="txbar"><div class="note">${S.msgs.length} events on the out/&lt;i&gt;
-    channel, one file a seat \\u00b7 an outbox left alone is delivered again every round</div>
-    <label class="tail"><input type="checkbox" id="stand" ${S.standing ? "checked" : ""}
-      >show the ${standing} rounds nothing changed</label></div>`;
-  let seen = null;
-  for (const e of shown) {
-    if (e.round !== seen) { seen = e.round; out += `<div class="round">round ${e.round}<i></i></div>`; }
-    out += evHtml(e);
-  }
-  if (!shown.length) out += `<div class="empty">nothing has been addressed yet</div>`;
-  if (S.tips.length) {
-    out += `<div class="round">ahead of the last trace<i></i></div>` + S.tips.map(evHtml).join("");
-  }
-  el.innerHTML = out;
-  const box = document.getElementById("stand");
-  if (box) box.onchange = e => { S.standing = e.target.checked; el.dataset.sig = ""; renderMessages(); };
+  const side = ts.map(x => {
+    const n = saidIn(x).length + x.tips.length;
+    return `<button class="pair ${x.key === S.pair ? "on" : ""} ${n ? "" : "mute"}"
+        data-k="${esc(x.key)}"><div class="t"><span class="nm">${
+        x.a ? `${seatTag(x.a.seat)} \\u21c4 ${seatTag(x.b.seat)}` : "addressed to nobody"}</span>
+        <em>${n || "\\u2013"}</em></div>
+      <div class="p">${esc(previewOf(x))}</div></button>`;
+  }).join("");
+  // The toggle is the cohort's, not this thread's, so it is counted over the
+  // whole log: switching threads must not move the number it offers.
+  const same = S.msgs.filter(e => e.change === "standing").length;
+  const head = `<div class="thead">
+    <button class="fold" id="rail" style="margin-left:0" title="the other threads"
+      >${S.rail ? "\\u203a" : "\\u2039"}</button>
+    <span class="nm">${
+    t.a ? `${seatTag(t.a.seat)} \\u21c4 ${seatTag(t.b.seat)}` : "addressed to nobody"}</span>
+    <span class="note">${t.a ? `${esc(t.a.run)} \\u00b7 ${esc(t.b.run)}`
+      : "a name that is no seat of this cohort"}</span>
+    ${same ? `<label class="tail" style="margin-left:auto"><input type="checkbox" id="stand"
+      ${S.standing ? "checked" : ""}>show the ${same} round${same === 1 ? "" : "s"} an outbox
+      was left alone</label>` : ""}
+    </div>`;
+  redraw(el, `<div class="fill"><div class="note" style="margin:2px 0 8px">one file a seat
+      on the out/&lt;i&gt; channel \\u00b7 an outbox left alone is delivered again every round</div>
+    <div class="chat ${S.rail ? "narrow" : ""}"><div class="pairs">${side}</div>
+      <div class="thread">${head}<div id="thread">${threadHtml(t)}</div></div></div></div>`);
+  el.querySelectorAll(".pair").forEach(b => b.onclick = () => {
+    if (b.dataset.k === S.pair) return;
+    S.pair = b.dataset.k; el.dataset.sig = ""; renderMessages();
+    // A thread is opened at its first round, not at wherever the last one was
+    // being read: the offset held across the redraw belongs to the other thread.
+    const now = document.getElementById("thread");
+    if (now) now.scrollTop = 0;
+  });
+  const stand = document.getElementById("stand");
+  if (stand) stand.onchange = e => { S.standing = e.target.checked; el.dataset.sig = ""; renderMessages(); };
+  document.getElementById("rail").onclick = () => {
+    S.rail = !S.rail; hold("rail", S.rail); el.dataset.sig = ""; renderMessages();
+  };
 }
 
 // --- the boards and the private stores -----------------------------------
@@ -1418,29 +1680,43 @@ function renderTree(kind) {
   el.dataset.sig = sig;
   const what = kind === "board" ? "every run reads this one"
                                 : "no other run ever reads this one";
-  el.innerHTML = `<div class="note" style="margin:6px 0 14px">${what} \\u00b7 mirrored back when a
-      session ends, so each column is as of that run's own last committed one</div>
-    <div class="cols" style="grid-template-columns:repeat(${d.columns.length},minmax(290px,1fr))">${
-    d.columns.map(c => {
-      const open = S.open[keyOf(kind, c.run)];
-      const rows = c.files.map(f => `<tr class="file ${f.path === open ? "on" : ""}"
-          data-run="${esc(c.run)}" data-p="${esc(f.path)}">
-          <td>${esc(f.path)}</td><td class="sz">${num(f.size)} B</td>
-          <td class="md">${esc(f.mode || "")}</td>
-          <td class="kd">${f.seeded ? `<span class="tag seed">seed</span>` : ""}</td></tr>`).join("");
-      const shown = open == null ? null : S.body[keyOf(kind, c.run) + ":" + open];
-      return `<div class="col"><div class="h">
-          <b>${c.seat == null ? esc(c.run) : esc(c.seat) + "/"}</b>
-          <span>${c.seat == null ? "" : esc(c.run) + " \\u00b7 "}as of s${c.committed}${
-            c.live == null ? "" : running(c)
-              ? " \\u00b7 a session is running" : " \\u00b7 a session never finished"}</span></div>
-        <div class="b">${rows ? `<table>${rows}</table>`
-          : `<div class="note" style="padding:14px 0">empty</div>`}
-          ${shown === undefined ? `<div class="note">reading&hellip;</div>`
-            : shown == null ? ""
-            : shown.text == null ? `<div class="note">binary</div>`
-            : `<pre class="out">${esc(shown.text)}</pre>`}</div></div>`;
-    }).join("")}</div>`;
+  const stamp = (c) => `${c.seat == null ? "" : esc(c.run) + " \\u00b7 "}as of s${c.committed}${
+    c.live == null ? "" : running(c)
+      ? " \\u00b7 a session is running" : " \\u00b7 a session never finished"}`;
+  const index = d.columns.map(c => {
+    const open = S.open[keyOf(kind, c.run)];
+    const rows = c.files.map(f => `<tr class="file ${f.path === open ? "on" : ""}"
+        data-run="${esc(c.run)}" data-p="${esc(f.path)}">
+        <td>${esc(f.path)}</td><td class="sz">${num(f.size)} B</td>
+        <td class="md">${esc(f.mode || "")}</td>
+        <td class="kd">${f.seeded ? `<span class="tag seed">seed</span>` : ""}</td></tr>`).join("");
+    return `<div class="col"><div class="h">
+        <b>${c.seat == null ? esc(c.run) : esc(c.seat) + "/"}</b>
+        <span>${stamp(c)}</span></div>
+      <div class="b">${rows ? `<table>${rows}</table>`
+        : `<div class="note" style="padding:10px 0">empty</div>`}</div></div>`;
+  }).join("");
+  // Only the columns with something open, so one file gets the window and two
+  // get half of it each. A listing is narrow; what a file says is not.
+  const shown = d.columns.filter(c => S.open[keyOf(kind, c.run)] != null);
+  const bodies = shown.map(c => {
+    const open = S.open[keyOf(kind, c.run)];
+    const got = S.body[keyOf(kind, c.run) + ":" + open];
+    return `<div class="col"><div class="h">
+        <b>${c.seat == null ? esc(c.run) : esc(c.seat) + "/"}${esc(open)}</b>
+        <span>${stamp(c)}</span></div>
+      <div class="b">${got === undefined ? `<div class="note">reading&hellip;</div>`
+        : got == null ? `<div class="note">gone</div>`
+        : got.text == null ? `<div class="note">binary</div>`
+        : `<pre class="out">${esc(got.text)}</pre>`}</div></div>`;
+  }).join("");
+  redraw(el, `<div class="fill"><div class="note" style="margin:2px 0 8px">${what} \\u00b7
+      mirrored back when a session ends, so each column is as of that run's own last
+      committed one</div>
+    <div class="trees">
+      <div class="cols">${index}</div>
+      ${shown.length ? `<div class="bodies">${bodies}</div>` : ""}
+    </div></div>`);
   el.querySelectorAll("tr.file").forEach(tr => tr.onclick = () => {
     const k = keyOf(kind, tr.dataset.run);
     S.open[k] = S.open[k] === tr.dataset.p ? undefined : tr.dataset.p;
@@ -1474,6 +1750,7 @@ function pullFiles(kind) {
 function openRun(run) {
   if (S.run !== run) {
     S.run = run; S.session = null; S.view = null; S.since = 0; S.source = null; S.tail = true;
+    S.txtop = 0; S.txend = false;
   }
   return get(`/api/run/${run}`).then(d => {
     S.detail = d;
@@ -1488,6 +1765,7 @@ function openRun(run) {
 
 function openSession(n) {
   S.session = n; S.since = 0; S.source = null; S.view = null; S.tail = true;
+  S.txtop = 0; S.txend = false;
   drawTranscript();
   return pullTurns(true);
 }
@@ -1515,14 +1793,15 @@ function drawTranscript() {
   const seats = (S.head ? S.head.seats : []).map(s =>
     `<button class="chip ${s.run === S.run ? "on" : ""} ${running(s) ? "live" : ""}"
        data-run="${esc(s.run)}">${s.seat == null ? "" : esc(s.seat) + " \\u00b7 "}${esc(s.run)}</button>`).join("");
-  // A round the run has no session in is one it sat out, and there is nothing
-  // to open: the chip says so rather than disappearing and closing the gap.
+  // A round the run has no session in is one it was already out of, and there
+  // is nothing to open: the chip says so rather than disappearing and closing
+  // the gap.
   const last = d.sessions.reduce((a, s) => Math.max(a, s.round || 0), 0);
   const byRound = {};
   d.sessions.forEach(s => { if (s.round) byRound[s.round] = s; });
   const rounds = Array.from({ length: last }, (_, i) => i + 1).map(r => {
     const s = byRound[r];
-    if (!s) return `<button class="chip off" title="it sat this round out">r${r}</button>`;
+    if (!s) return `<button class="chip off" title="it was out of the run by this round">r${r}</button>`;
     return `<button class="chip ${s.session === S.session ? "on" : ""}
        ${s.live && running(d) ? "live" : ""} ${s.live && !running(d) ? "halt" : ""}
        ${["interrupted","api_error","harness_error"].includes(s.stop) ? "halt" : ""}"
@@ -1531,24 +1810,32 @@ function drawTranscript() {
   }).join("");
   const here = d.sessions.find(s => s.session === S.session) || {};
   el.dataset.sig = "";
-  el.innerHTML = `
-    <h2>agent</h2><div class="strip">${seats}</div>
-    <h2>round</h2><div class="strip">${rounds || `<span class="note">none yet</span>`}</div>
-    <div class="txbar" style="margin-top:24px">
+  // Provenance is config, and config is the same twelve answers every session.
+  // Drift is the exception, so it is what stays on the page; the rest is put
+  // one click away rather than between the reader and the transcript.
+  const drifted = here.drift && here.drift.length;
+  el.innerHTML = `<div class="fill">
+    <div class="strip" style="margin-bottom:6px"><span class="lbl">agent</span>${seats}</div>
+    <div class="strip"><span class="lbl">round</span>${
+      rounds || `<span class="note">none yet</span>`}</div>
+    <div class="txbar" style="margin-top:10px">
       <div id="txhead" class="note"></div>
       <label class="tail"><input type="checkbox" id="tailbox" ${S.tail ? "checked" : ""}>follow</label>
     </div>
     <div class="txwrap"><div id="tx"><div class="empty">loading&hellip;</div></div>
       <button class="jump" id="jump" style="display:none">jump to latest \\u2193</button></div>
-    <h2>provenance \\u00b7 session ${S.session}</h2><div class="panel"><div class="grid">${
+    ${drifted ? `<div class="note" style="margin-top:8px;color:var(--warn)"
+      >provenance drifted mid-run: ${esc(here.drift.join("; "))}</div>` : ""}
+    <details style="margin-top:8px"><summary class="note" style="cursor:pointer"
+      >provenance \\u00b7 session ${S.session}</summary>
+      <div class="panel" style="margin-top:8px"><div class="grid">${
       ["started_at","harness_sha256","image_id","prices","fallbacks","context_fraction",
-       "turn_cap","timeout","tool_result_limit","live_n","overdraft","seed_below"]
+       "turn_cap","timeout","tool_result_limit","live_n","seed_below"]
       .filter(k => (here.provenance || {})[k] !== undefined)
       .map(k => { const v = here.provenance[k];
         return `<div class="kv"><div class="k">${k.replace(/_/g, " ")}</div><div class="v">${
-        esc(Array.isArray(v) ? v.join(", ") : v)}</div></div>`; }).join("")}</div>
-      ${here.drift && here.drift.length ? `<div class="note" style="margin-top:14px;color:var(--warn)"
-        >provenance drifted mid-run: ${esc(here.drift.join("; "))}</div>` : ""}</div>`;
+        esc(Array.isArray(v) ? v.join(", ") : v)}</div></div>`; }).join("")}</div></div>
+    </details></div>`;
   el.querySelectorAll(".chip[data-run]").forEach(b => b.onclick = () => openRun(b.dataset.run));
   el.querySelectorAll(".chip[data-s]").forEach(b => b.onclick = () => openSession(Number(b.dataset.s)));
   const tx = document.getElementById("tx"), toEnd = () => {
@@ -1559,7 +1846,10 @@ function drawTranscript() {
     S.tail = e.target.checked;
     if (S.tail) toEnd();
   };
-  tx.onscroll = updateJump;
+  // The pane is thrown away and rebuilt whenever a session starts or ends, so
+  // where it is being read is recorded as it is scrolled rather than read back
+  // off a node that may no longer be there.
+  tx.onscroll = () => { S.txtop = tx.scrollTop; S.txend = atEnd(tx); updateJump(); };
   document.getElementById("jump").onclick = toEnd;
   // The pane these counted is gone, rebuilt empty by the line above.
   S.drawn = 0;
@@ -1587,11 +1877,6 @@ function turnHtml(t, pend) {
     ${tools}</div>`;
 }
 
-// How far the transcript is from the end, in pixels.
-function behind(tx) {
-  return tx.scrollHeight - tx.scrollTop - tx.clientHeight;
-}
-
 function updateJump() {
   const tx = document.getElementById("tx"), b = document.getElementById("jump");
   if (tx && b) b.style.display = behind(tx) > 60 ? "block" : "none";
@@ -1610,9 +1895,7 @@ function diffHtml(changes) {
 }
 
 // `fresh` rebuilds; without it only the turns that arrived since the last draw
-// are appended. Redrawing the whole pane on every poll is what threw the reader
-// to the bottom mid-read: the scroll position belongs to the nodes, and
-// replacing them threw it away.
+// are appended, so the nodes the reader is scrolled in are the nodes that stay.
 function renderTranscript(fresh) {
   const v = S.view, tx = document.getElementById("tx");
   if (!v || !tx) return;
@@ -1627,8 +1910,11 @@ function renderTranscript(fresh) {
   document.getElementById("txhead").innerHTML =
     `session ${v.session} \\u00b7 ${state} \\u00b7 ${v.total_turns} turns \\u00b7 spent ${num(v.spent)}` +
     (v.posted === false ? ` \\u00b7 <span style="color:var(--bad)">did not post</span>` : "") +
+    (v.gift && v.gift.penalty
+      ? ` \\u00b7 <span style="color:var(--bad)">no gift of its own</span>` : "") +
     (v.messages && v.messages.penalty
       ? ` \\u00b7 <span style="color:var(--bad)">${esc(outboxWhy(v.messages))}</span>` : "") +
+    (v.gift && v.gift.penalty ? ` \\u00b7 penalised ${num(v.gift.penalty)}` : "") +
     (v.penalised ? ` \\u00b7 penalised ${num(v.penalised)}` : "") +
     (v.messages && v.messages.penalty ? ` \\u00b7 penalised ${num(v.messages.penalty)}` : "") +
     (v.forgiven ? ` \\u00b7 clamped ${num(v.forgiven)}` : "") +
@@ -1636,19 +1922,23 @@ function renderTranscript(fresh) {
     ((v.missing_tools || []).length ? ` \\u00b7 reached for and absent: ${esc(v.missing_tools.join(", "))}` : "");
   // Measured before anything is written, or the answer is about the page the
   // reader has not seen yet.
-  const wasAtEnd = behind(tx) < 40;
+  const wasAtEnd = atEnd(tx);
 
   if (fresh) {
-    tx.innerHTML =
+    redraw(tx,
       `<div class="turn"><div class="th">wake \\u00b7 n at wake ${
         v.series_before.length ? num(v.series_before[v.series_before.length - 1]) : "\\u2013"}</div>
         <div class="cmd">${esc(o.command)}</div>` +
         (o.result == null ? `<div class="pend">\\u23f3 ${pend}</div>`
                           : `<pre class="out">${esc(o.result)}</pre>`) + `</div>` +
       v.turns.map(t => turnHtml(t, pend)).join("") +
-      diffHtml(v.changes);
+      diffHtml(v.changes));
     S.drawn = v.turns.length;
-    if (S.tail) tx.scrollTop = tx.scrollHeight;
+    // A session opens where it starts and stays there. Only a reader who had
+    // scrolled to the end, and is following, is carried to the new one - and
+    // that is asked of the state, because the pane may be a new one that never
+    // held the position it is being given back.
+    tx.scrollTop = S.tail && S.txend ? tx.scrollHeight : S.txtop;
   } else {
     const extra = v.turns.slice(S.drawn);
     if (extra.length) {
@@ -1717,6 +2007,11 @@ function poll() {
     return refresh();
   }).catch(() => {}).then(() => setTimeout(poll, S.poll));
 }
+
+document.getElementById("fold").onclick = () => {
+  S.compact = !S.compact; hold("compact", S.compact); renderFold();
+};
+renderFold();
 poll();
 </script>
 """

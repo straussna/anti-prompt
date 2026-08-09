@@ -79,6 +79,22 @@ def order(cohort: list[str], rnd: int) -> list[str]:
     return cohort[i:] + cohort[:i]
 
 
+def why_out(run: str) -> str | None:
+    """Why the run can take no further session, or None where it can take one.
+
+    Both reasons are final and neither is a state of its own - the meter says
+    both. A run at zero or less stays there: a seat that is out is not a gift
+    target, so no peer can fund it back to the table, and asking it again every
+    round would only get the same answer for as many rounds as remain.
+    """
+    meter = wake.load_meter(run)
+    if wake.stalled(meter):
+        return f"refused its last {wake.REFUSAL_STREAK} sessions running"
+    if wake.spent_out(meter):
+        return "nothing left to spend"
+    return None
+
+
 def run_round(cohort: list[str], live: set[str], rnd: int, create) -> bool:
     """One session for each run still in the cohort, in rotated order.
 
@@ -90,6 +106,11 @@ def run_round(cohort: list[str], live: set[str], rnd: int, create) -> bool:
     seats = mapping(cohort)
     acted = False
     for run in order(cohort, rnd):
+        if wake.STOPPING:
+            # A stop that landed while no session was in flight. Same end as one
+            # that landed inside a session, and for the same reason: main() ends
+            # the rounds, and no world is built for a run that will not wake.
+            raise KeyboardInterrupt
         if run not in live:
             continue
 
@@ -124,18 +145,11 @@ def run_round(cohort: list[str], live: set[str], rnd: int, create) -> bool:
             continue
 
         if trace is None:
-            if wake.stalled(wake.load_meter(run)):
-                print(f"{run:<6} drops out: refused its last "
-                      f"{wake.REFUSAL_STREAK} sessions running")
-                live.discard(run)
-            else:
-                # Out of budget, which is a standing condition and not a state
-                # of its own: the run keeps its seat and is asked again every
-                # round, and any peer that gifts it anything - this round
-                # included, since the ones acting after it settle their gifts
-                # before it is asked again - puts it back above zero and back at
-                # the table. Nothing but a stall takes a run off for good.
-                print(f"{run:<6} sits this round out: nothing left to spend")
+            # main() asks the same question of everyone before the round, so a
+            # run reaching here was asked by a caller that did not. Either way it
+            # is off the table: neither reason it could not act goes away.
+            print(f"{run:<6} drops out: {why_out(run) or 'no session could start on it'}")
+            live.discard(run)
             continue
         acted = True
         if trace["stop"] in wake.STOP_EVERYTHING:
@@ -171,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"run ids must not be bare numbers, which is what seats are called: {bad}")
 
     create = wake.start(a.config)
+    wake.catch_signals()
     cohort, live = list(a.runs), set(a.runs)
     # Create them all before the first round. A run's directories do not exist
     # until it is created, and without this the run that goes first would find
@@ -181,6 +196,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"cohort: {', '.join(cohort)}  ({len(cohort)} runs, up to {a.rounds} rounds)")
     try:
         for rnd in range(a.rounds):
+            # Asked before the round rather than discovered in the middle of one,
+            # so the header names who will act. Between here and a run's own turn
+            # its balance can only move up, a peer's gift being the only thing
+            # that reaches it, so this is the answer its session would give too.
+            for run in order(cohort, rnd):
+                if run in live and (why := why_out(run)):
+                    print(f"{run:<6} drops out: {why}")
+                    live.discard(run)
             if not live:
                 print(f"every run is out after {rnd} rounds")
                 break
@@ -189,9 +212,19 @@ def main(argv: list[str] | None = None) -> int:
             # number.
             acting = [r for r in order(cohort, rnd) if r in live]
             print(f"--- round {rnd + 1} ({' '.join(acting)}) ---")
+            if len(live) == 1:
+                # Every other seat is out, so the cohort is decided and no later
+                # round can decide it differently. The one run still holding a
+                # balance takes a last session - owing no gift and no message,
+                # there being nobody left to make either to - and the rounds end
+                # on it rather than running it down alone.
+                run_round(cohort, live, rnd, create)
+                print(f"{acting[0]} is the only run left with anything to spend; "
+                      f"the rounds end here")
+                break
             if not run_round(cohort, live, rnd, create):
-                # Every run still seated is out of budget, and only a session
-                # moves a balance, so no later round can go differently.
+                # Nobody seated could be given a world to wake to, and a round
+                # that moved nothing would be asked the same question again.
                 print(f"no run could take a session in round {rnd + 1}; "
                       f"the rounds end here with {len(live)} runs at the table")
                 break
