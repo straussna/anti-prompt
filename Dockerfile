@@ -58,9 +58,14 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker \
 # Non-root. State is copied in and owned by this user, never bind-mounted:
 # wake.py probes /work/state for writability before spending anything, so a
 # mismatch fails loudly at session start instead of silently losing state.
+#
+# /work itself is root's, and only state/ below it is the agent's. The balances
+# are written into /work, where a mode is enough to make them read-only: rm and
+# mv ask the directory rather than the file, so a file the agent cannot write
+# is only safe while it sits somewhere the agent cannot write either.
 RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
  && mkdir -p /work/state \
- && chown -R agent:agent /work
+ && chown agent:agent /work/state
 
 USER agent
 WORKDIR /work

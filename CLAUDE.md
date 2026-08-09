@@ -9,7 +9,7 @@ this ladder and stop at the first rung that covers what you changed.
 | what you changed | run |
 |---|---|
 | one behaviour, and you know its name | `py -3 check.py <name-fragment>` |
-| pricing, metering, refusals, traces, seeds, forks, cohort | `py -3 check.py --no-docker` |
+| pricing, metering, refusals, traces, seeds, forks, cohort, gifts, the ledger, messages, the post penalty, the message penalty, the clamp | `py -3 check.py --no-docker` |
 | anything, before handing work over | `py -3 check.py` |
 | `wake.py`'s session path — the container, the shell, `load_state`/`save_state`, `run_once` | `py -3 check.py --real` |
 
@@ -26,8 +26,10 @@ stop a session ended on. A container proves none of that, so those sessions run
 in a directory and a bash process on this machine.
 
 What only a container can show — modes, ownership, the dead network, what the
-image has and lacks — takes a real one. Those are the checks that skip when
-Docker is down, and the reason `--no-docker` still runs 65 of 86.
+image has and lacks — takes a real one. That includes the checks that an inbox
+and the gift ledger really are root's and really do refuse every route into
+them. Those are the checks that skip when Docker is down, and the reason
+`--no-docker` still runs 95 of 113.
 
 `--real` puts every check in a container. It is what says the two lanes still
 agree, so run it after changing how a session is set up or torn down. It is not
@@ -41,6 +43,11 @@ work is done.
 Docker Desktop slows down markedly after a few hundred containers. A full run
 that took 40s on a fresh daemon can take two minutes later in a long session.
 That is the daemon, not a regression — restart Docker rather than hunting it.
+
+A suite run only removes containers carrying its own pid, so two runs at once
+leave each other alone and no run of `check.py` can touch a live experiment.
+Nothing collects what a run killed outright leaves behind: `--sweep-all` does,
+and is the only mode that reaches a container this process did not make.
 
 Two checks are wall-clock sensitive by design: `hostile_output_survives` (a 4MB
 flood against a deadline) and anything setting `TIMEOUT`. Running with `-j` above

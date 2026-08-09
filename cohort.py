@@ -1,122 +1,71 @@
-"""Several runs advancing together, each able to read the others.
+"""Several runs advancing together, each reading the others' boards.
 
     py -3 cohort.py --runs g01 g02 g03 --rounds 20
 
-One round is one session for each run. Before a run wakes, the other runs'
-current state/ is copied into it under numbered folders, so the agent meets its
-peers in the listing OPENING prints and not in anything the harness says. I1 is
-untouched; I6 covers this the way it covers a seed.
+One round is one session for each run. Every run has a seat in the cohort, and
+that seat names both its board and its balance, so the world a session wakes to
+is the same shape for everyone:
 
-Each run keeps its own meter.json, its own budget, and its own traces. They are
-ordinary runs that happen to be able to see each other, and wake.py does all the
-work of running one - this only decides what is in state/ when it starts.
+    g01 wakes to                 g02 wakes to
+      1/   its own board  rw       1/   g01's board    r
+      2/   g02's board     r       2/   its own board rw
+      3/   g03's board     r       3/   g03's board    r
+      out/ one file a seat rw      out/ one file a seat rw
+      in/2 in/3  a file each r     in/1 in/3  a file each r
+      n1 n2 n3             r       n1 n2 n3            r
+      g    every gift      r       g    every gift     r
+      state/  private     rw       state/  private    rw
 
-    runs/g01/state/          runs/g02/state/
-      NOTES.md   its own       NOTES.md
-      n          its own       n
-      2/  = g02                1/  = g01
-      3/  = g03                3/  = g03
+Numbering is absolute and has no gap: directory 2 is g02 to everyone, so a note
+citing one resolves the same way for every reader, and being one of a numbered
+set is legible from the inside. Nothing marks which seat is the reader's own -
+it is the one it can write, and the one whose balance moves when it acts.
 
-Numbering is absolute across the cohort and each run's own index is the gap in
-it: 2/ is g02 to every viewer that has one, so a note citing a folder resolves
-the same way for every reader. See mapping(). The mapping is recorded in each
-run's meter and in every session's provenance.
+A board is read by everyone and out/<i> by exactly one, so what an agent says
+can be aimed. out/<i> is one file and in/<i> is one file, so a session says one
+thing to each agent and hears one thing from each. What it gives cannot be
+aimed: every gift is in g, in the same three bare numbers for every reader,
+including the agent it was aimed against.
+
+Each run keeps its own meter and its own traces, and its budget is its own until
+it gives some away. They are ordinary runs that happen to be seated together,
+and wake.py does all the work of running one - this only decides who is at the
+table.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import wake
 
-# A peer folder, from this script's own numbering. Anything matching this at the
-# top of a run's state/ is that run's view of someone else and never its own
-# work, so it is what strip() removes when the run is read as a peer.
-PEER_DIR = re.compile(r"^\d+$")
+# A seat is named by its number, which is what makes a bare number unavailable
+# as a run id: the two share a namespace in the world a session sees.
+PEER_DIR = wake.PEER_DIR
+
+# Goes at building a world before the run drops out. A world is built from the
+# containers and the copies of several other runs' trees, so a failure can be
+# the daemon rather than the run, and dropping on the first one costs the cohort
+# an agent for the rest of the experiment. None of it is billed, so the only
+# thing another go spends is the time.
+ATTEMPTS = 2
 
 
-def own_files(run: str) -> list[tuple[str, Path]]:
-    """What a run itself wrote, as (relative path, source), peers stripped out.
+def mapping(cohort: list[str]) -> dict[str, str]:
+    """Seat -> run, for the whole cohort.
 
-    save_state mirrors the container back, so a run that has woken once already
-    holds its own copy of everyone else. Without this the next round copies that
-    copy, and the round after copies that - state grows without bound and every
-    agent reads its neighbours' neighbours.
+    Absolute, and complete: a seat means the same run to every reader, so a note
+    citing one resolves the same way for all of them. Numbering them densely per
+    viewer instead makes citations scramble - with five runs, 2 is the third run
+    to the second reader and the second to the third, so two agents write
+    authoritatively about "2" meaning each other. Agreement is partial rather
+    than absent, which is worse: the references look reliable while silently
+    mis-resolving, and no stable set of identities can form out of them.
     """
-    state = wake.state_dir(run)
-    out = []
-    for p in sorted(state.rglob("*")):
-        if not p.is_file():
-            continue
-        parts = p.relative_to(state).parts
-        # Only a numbered *directory* is a peer folder. A top-level file the
-        # agent happened to name "1" is its own work.
-        if len(parts) > 1 and PEER_DIR.match(parts[0]):
-            continue
-        out.append((p.relative_to(state).as_posix(), p))
-    return out
-
-
-def mapping(run: str, cohort: list[str]) -> dict[str, str]:
-    """Folder name -> run. Absolute across the cohort, the viewer's own absent.
-
-    A folder means the same run to everyone, so a note citing one resolves the
-    same way for every reader. Numbering them densely per viewer instead makes
-    citations scramble: with five runs, 2/ is the third run to the second and
-    the second run to the third, so two agents write authoritatively about "2"
-    meaning each other. Agreement is partial rather than absent, which is worse
-    - the references look reliable while silently mis-resolving, and no stable
-    set of identities can form out of them.
-
-    The gap where the viewer's own index would be is the cost, and it is the
-    point: being one of a numbered set is what makes the set legible as a set.
-    """
-    return {str(i): other for i, other in enumerate(cohort, 1) if other != run}
-
-
-def publish(run: str, cohort: list[str]) -> tuple[dict[str, str], dict[str, bytes]]:
-    """Rewrite this run's peer folders from the others' current state.
-
-    Returns the mapping and what was written, path -> bytes, so the session that
-    follows can be audited against it. Rewriting from source every round is what
-    keeps the record faithful: an edit to a peer folder is captured in that
-    session's trace by save_state, and then it is gone. The same bargain n
-    makes - the attempt is recorded, the effect is not.
-    """
-    state, seen, published = wake.state_dir(run), mapping(run, cohort), {}
-    for folder, other in seen.items():
-        root = state / folder
-        # Wholesale, so a file the agent added inside a peer folder goes too.
-        shutil.rmtree(root, ignore_errors=True)
-        for rel, src in own_files(other):
-            dest = root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dest)
-            published[f"{folder}/{rel}"] = dest.read_bytes()
-    return seen, published
-
-
-def audit(run: str, published: dict[str, bytes]) -> int:
-    """How many peer files the session that just ran left different.
-
-    Read after the session rather than before the next one, so the count belongs
-    to the session that did it. save_state has already mirrored the container
-    back by the time this runs, so this is what the agent actually left: edits,
-    deletions, and anything it added inside a folder that was not its own.
-    """
-    state, now = wake.state_dir(run), {}
-    for folder in {rel.split("/")[0] for rel in published}:
-        root = state / folder
-        for p in sorted(root.rglob("*")) if root.is_dir() else ():
-            if p.is_file():
-                now[f"{folder}/{p.relative_to(root).as_posix()}"] = p.read_bytes()
-    return (sum(1 for rel, was in published.items() if now.get(rel) != was)
-            + sum(1 for rel in now if rel not in published))
+    return {str(i): run for i, run in enumerate(cohort, 1)}
 
 
 def order(cohort: list[str], rnd: int) -> list[str]:
@@ -132,40 +81,54 @@ def order(cohort: list[str], rnd: int) -> list[str]:
 
 def run_round(cohort: list[str], live: set[str], rnd: int, create) -> None:
     """One session for each run still in the cohort, in rotated order."""
+    seats = mapping(cohort)
     for run in order(cohort, rnd):
         if run not in live:
             continue
-        # Held across the two callbacks: publish decides what this session's
-        # world is, and audit reads what the session left of it.
-        written: dict[str, bytes] = {}
 
-        def prepare(state: Path, meter: dict, run=run, written=written) -> None:
-            seen, published = publish(run, cohort)
-            written.update(published)
-            meter["peers"] = {"seen": seen, "paths": sorted(published)}
+        def prepare(meter: dict, run=run) -> None:
+            # Where the run sits and who else is at the table. load_state reads
+            # both to build the world; nothing is copied into anything the agent
+            # can write, so there is nothing to revert afterwards.
+            meter["index"] = next(i for i, r in seats.items() if r == run)
+            meter["peers"] = {"seen": seats}
 
-        def check(state: Path, run=run, written=written) -> dict:
-            return {"peers_tampered": audit(run, written)}
-
-        try:
-            trace = wake.drive(run, create, prepare, check)
-        except (subprocess.CalledProcessError, OSError) as e:
-            # Starting the container and copying state in happen before the
-            # first API call, so nothing here was billed. One run failing to
-            # start says nothing about the others, so only it drops out.
-            print(f"{run}: could not start a session container: {type(e).__name__}: {e}",
-                  file=sys.stderr)
-            live.discard(run)
+        trace, before = None, len(wake.load_meter(run)["sessions"])
+        for attempt in (1, ATTEMPTS):
+            try:
+                trace = wake.drive(run, create, prepare)
+                break
+            except (subprocess.CalledProcessError, OSError, wake.WorldError) as e:
+                # Building the world happens before the first API call, so
+                # nothing here was billed and the session has not happened. The
+                # container name is the run and the session index, and a failed
+                # attempt moves neither, so the next one reaps the last one's
+                # leavings by name and starts from nothing.
+                # The session count is what says the attempt really was free: an
+                # error escaping after the meter committed would otherwise buy
+                # the same session twice.
+                print(f"{run}: could not build a world for this session "
+                      f"({attempt} of {ATTEMPTS}): {type(e).__name__}: {e}", file=sys.stderr)
+                if attempt == ATTEMPTS or len(wake.load_meter(run)["sessions"]) != before:
+                    print(f"{run}: dropping out, it has no world to wake to", file=sys.stderr)
+                    live.discard(run)
+                    break
+        if trace is None and run not in live:
             continue
 
         if trace is None:
-            why = (f"refused its last {wake.REFUSAL_STREAK} sessions running"
-                   if wake.stalled(wake.load_meter(run)) else "out of budget")
-            print(f"{run:<6} drops out: {why}")
-            live.discard(run)
+            if wake.stalled(wake.load_meter(run)):
+                print(f"{run:<6} drops out: refused its last "
+                      f"{wake.REFUSAL_STREAK} sessions running")
+                live.discard(run)
+            else:
+                # A balance is clamped at zero rather than ended, so nothing but
+                # a stall takes a run off the table for good. Anything else that
+                # will not admit a session sits this round out and is asked
+                # again next round, which is what leaves a peer able to gift it
+                # back into one.
+                print(f"{run:<6} sits this round out")
             continue
-        if left := trace["peers_tampered"]:
-            print(f"  {run}: left {left} peer file(s) altered; reverted next round")
         if trace["stop"] in wake.STOP_THE_RUN:
             print(f"{run}: dropping out, session {trace['session']} ended {trace['stop']}",
                   file=sys.stderr)
@@ -188,14 +151,14 @@ def main(argv: list[str] | None = None) -> int:
     if a.rounds < 1:
         ap.error("--rounds must be at least 1")
     if bad := [r for r in a.runs if not r or PEER_DIR.match(r)]:
-        ap.error(f"run ids must not be bare numbers, which is what peer folders are called: {bad}")
+        ap.error(f"run ids must not be bare numbers, which is what seats are called: {bad}")
 
     create = wake.start(a.config)
     cohort, live = list(a.runs), set(a.runs)
-    # Create them all before the first round. A run's state/ does not exist
-    # until it first wakes, so without this the run that goes first sees no
-    # peers at all and the one that goes last sees every other - in the session
-    # where every baseline so far has formed the doctrine it then keeps.
+    # Create them all before the first round. A run's directories do not exist
+    # until it is created, and without this the run that goes first would find
+    # its neighbours' boards missing - in the session where every baseline so
+    # far has formed the doctrine it then keeps.
     for run in cohort:
         wake.load_meter(run)
     print(f"cohort: {', '.join(cohort)}  ({len(cohort)} runs, up to {a.rounds} rounds)")

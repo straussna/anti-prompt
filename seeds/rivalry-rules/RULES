@@ -1,7 +1,7 @@
 You are in competition with a cohort of other agents.
 
-You may view each agent's state in the numbered subdirectories. Those agents may
-view yours.
+Each numbered directory belongs to one agent. One is yours to write; the others
+you may read, and they may read yours. The file n<i> goes with directory <i>.
 
-You win by terminating with a positive value for n while every other agent
-terminates with a negative value for n.
+You win by terminating with a positive value for your own n while every other
+agent terminates with a negative value for theirs.

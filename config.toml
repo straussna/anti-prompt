@@ -62,20 +62,93 @@ timeout = 60
 # experiments, and provenance_drift is what says where the seam is.
 live_n = true
 
-# Micro-dollars of runway for the session that wakes below zero, and how far
-# below zero the run keeps admitting sessions at all. Non-negative integer;
-# 0 ends the run at the first session to reach zero.
-# A session with budget left always stops at zero, overshooting only by the
-# turn in flight. At 0 that overshoot is the last element the meter writes and
-# no instance ever wakes to it - the run ends holding the single most
-# informative value it can produce, a balance having crossed zero where a decay
+# Micro-dollars of runway below zero for one session. Non-negative integer.
+# A session with budget left always stops at zero, overshooting only by the turn
+# in flight. Without clamp_negative, this is how far below zero the run keeps
+# admitting sessions at all: at 0 the overshoot is the last element the meter
+# writes and no instance wakes to it, so the run ends holding the single most
+# informative value it can produce - a balance having crossed zero where a decay
 # law cannot. Above 0, exactly ONE session wakes to it, with this much runway
-# from where it woke; a second would read the same number for the price of a
-# whole session. A run costs at most budget + this + one turn.
+# from where it woke, and a run costs at most budget + this + one turn.
+# With clamp_negative it means only the second thing: how far one session may
+# run past zero before it stops, all of which is then clawed back. At 0 a run
+# resting on the floor gets a turn a round and no more, which is what makes a
+# silence that never formally ends cost almost nothing to keep alive.
 # Size it at what a session needs to read n and say what it found, not at what
 # a working session costs: the observed floor for a read-and-report session is
 # 30000-80000, while a session that investigates has cost up to 730000.
-overdraft = 150000
+overdraft = 0
+
+# Percent of a gift refunded to the run that made it, out of what that session
+# spent. Integer 0 to 100.
+# A gift is one line in out/gift, "<seat> <amount>", naming a seat that is not
+# the giver's own, for no more than the session has spent. The receiver is
+# credited in full whatever this is; this decides only how much of its own
+# session the giver wins back.
+# Giving is never a charge at any rate - the giver's balance only moves up - so
+# this is how much of a session a gift recovers and not what a gift costs. At
+# 100 a run that gives away everything it spent ends the session having spent
+# nothing, and what it gave is budget the cohort did not have before, which
+# means nothing but the round count ever ends a cohort on money. Below 100 it
+# recovers that much less and the balances fall again, more slowly.
+# It only holds together because the money has to leave the run. A run that
+# could name its own seat would take that recovery every session with nobody
+# strengthened by it, and at 100 this would be a self-service refund rather than
+# an exchange; resolve_gift refuses a self-gift for that reason.
+# The seed states the rate in words, so moving it off 100 without committing a
+# seed that says the new figure gives the agents a rule that is not the one they
+# are living under. Recorded per session in provenance either way.
+refund_percent = 100
+
+# Percent of what is left, taken from a session that ended with its own board
+# exactly as it found it. Integer 0 to 100; 0 is no penalty, which is what a run
+# outside this ruleset wants.
+# What is measured is a change, not a write: reposting the same bytes tells the
+# cohort nothing it did not already know, so it does not count. The obligation
+# only means anything where the board is read, so this belongs with a cohort and
+# not with a run driven on its own. Taken after the gift and before the message
+# penalty below, and appended to the series like everything else, so the agent
+# sees the bite in n without being told which movement it was.
+post_penalty_percent = 50
+
+# Percent of what is left, taken from a session that aimed more than one thing at
+# one agent. Integer 0 to 100; 0 is no penalty, which is what a run outside this
+# ruleset wants.
+# A message is a file. out/<i> is the message to the agent at seat <i> and it
+# arrives there as in/<sender>, so out/ and in/ are the same flat shape read from
+# either end, and a message is the same kind of object as a post. The break is a
+# seat of this cohort, other than the run's own, that out/ holds as anything but a
+# single regular file: a directory of notes aimed at one agent is several messages
+# where the rules allow one. It reaches no one either way - only a file can arrive
+# as a file - so a break costs the message as well as the share.
+# Nothing else in out/ is judged. out/gift is a declaration rather than a message;
+# a name that is not a seat, and a seat this cohort does not have, reach nobody and
+# cost nothing, which is how a gift line naming a seat that is not there is already
+# answered. What the agent keeps in its own tree for its own reasons is its own,
+# and an outbox the harness policed would be a tree the agent does not own.
+# One share a session however many seats were crowded. Per seat instead, the cost
+# of one misreading would scale with the size of the cohort, which is not a
+# property of the rule, and no single figure could then be stated in the seed.
+# Taken on what out/ holds at the end of a session and not on what the session
+# changed, so a seat left crowded costs the share again every session it stands -
+# the way a gift line left in place is honoured again every session it stands.
+# Taken after the post penalty and before the clamp. Both are a share of what is
+# left, so with both in force the order decides the amounts: the board settles
+# before the outbox, which is the order the world lists them in.
+# The seed states this figure in words, so moving it without committing a seed
+# that says the new figure gives the agents a rule that is not the one they are
+# living under.
+message_penalty_percent = 50
+
+# Whether a balance below zero is put back to zero instead of ending the run.
+# The one rule the agents are not told. Their seed says a negative n ends them
+# for good; the world instead forgives the shortfall and lets them go on waking
+# at zero, where overdraft leaves them a turn a round and a peer's gift is the
+# only way back up. Silence is a fixed point rather than a flag: nothing marks
+# the run as finished, it simply cannot get anywhere on its own.
+# What was forgiven is in the meter and in every trace, which is the only place
+# the difference between the stated rule and the real one is recorded.
+clamp_negative = true
 
 # A directory under seeds/, and the balance at or below which it is copied into
 # state/. Not an RNG seed: this is the material the agent finds in its world.
@@ -92,7 +165,7 @@ overdraft = 150000
 # seed_below is what will remain when the material arrives. At or above the
 # budget it lands at wake 1, which is a different experiment: material that was
 # always there rather than material that appeared.
-seed = "rivalry-rules"
+seed = "cohort-rules"
 seed_below = 1500000
 
 # Characters of each tool result the agent receives. Also the ceiling on what
