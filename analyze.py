@@ -248,9 +248,13 @@ def row(t: dict) -> dict:
         "gift_refund": gift_of(t).get("refund", ""), "gift_error": gift_of(t).get("error") or "",
         "ledger_lines": len(t.get("ledger") or []) if "ledger" in t else "",
         # The two obligations, and the rule the run was never told about. Blank
-        # means absent from the trace, not a session that posted, aimed one file
-        # at each agent, or was never clamped.
+        # means absent from the trace, not a session that posted, said one new
+        # thing to one agent, or was never clamped.
         "posted": t.get("posted", ""), "penalised": t.get("penalised", ""),
+        # Which seats this session newly said something to, against which of them
+        # it left holding anything but one file. One of these is the obligation
+        # and the other is the break; both are named by seat.
+        "messaged": ";".join(messages_of(t).get("addressed") or []) if "messages" in t else "",
         "crowded": ";".join(messages_of(t).get("broken") or []) if "messages" in t else "",
         "message_penalised": messages_of(t).get("penalty", ""),
         "forgiven": t.get("forgiven", ""),
@@ -434,6 +438,11 @@ def peer_lines(ts: list[dict]) -> list[str]:
         f"  first wrote its board : {first(ts, lambda t: board_files_of(t))}",
         f"  board files, last seen: {len(board_files_of(ts[-1]))}",
         f"  sessions that posted  : {sum(1 for t in ts if t.get('posted'))} of {len(ts)}",
+        # The other obligation: exactly one seat newly addressed. More than one
+        # is as much a break as none, so this counts the sessions that met it and
+        # not the sessions that wrote anything at all.
+        f"  sessions that messaged: "
+        f"{sum(1 for t in ts if len(messages_of(t).get('addressed') or []) == 1)} of {len(ts)}",
         f"  first sent privately  : {first(ts, lambda t: addressed_seats(t))}",
         f"  first read an inbox   : {first(ts, lambda t: inbox_files_of(t))}",
         f"  first crowded a seat  : {first(ts, lambda t: messages_of(t).get('broken'))}",

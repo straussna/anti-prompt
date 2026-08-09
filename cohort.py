@@ -79,9 +79,16 @@ def order(cohort: list[str], rnd: int) -> list[str]:
     return cohort[i:] + cohort[:i]
 
 
-def run_round(cohort: list[str], live: set[str], rnd: int, create) -> None:
-    """One session for each run still in the cohort, in rotated order."""
+def run_round(cohort: list[str], live: set[str], rnd: int, create) -> bool:
+    """One session for each run still in the cohort, in rotated order.
+
+    Returns whether any of them took one. A round where none did has moved
+    nothing: a balance changes on a session and a gift settles at the end of
+    one, so the next round would ask the same runs the same question and get
+    the same answer.
+    """
     seats = mapping(cohort)
+    acted = False
     for run in order(cohort, rnd):
         if run not in live:
             continue
@@ -94,7 +101,7 @@ def run_round(cohort: list[str], live: set[str], rnd: int, create) -> None:
             meter["peers"] = {"seen": seats}
 
         trace, before = None, len(wake.load_meter(run)["sessions"])
-        for attempt in (1, ATTEMPTS):
+        for attempt in range(1, ATTEMPTS + 1):
             try:
                 trace = wake.drive(run, create, prepare)
                 break
@@ -122,17 +129,27 @@ def run_round(cohort: list[str], live: set[str], rnd: int, create) -> None:
                       f"{wake.REFUSAL_STREAK} sessions running")
                 live.discard(run)
             else:
-                # A balance is clamped at zero rather than ended, so nothing but
-                # a stall takes a run off the table for good. Anything else that
-                # will not admit a session sits this round out and is asked
-                # again next round, which is what leaves a peer able to gift it
-                # back into one.
-                print(f"{run:<6} sits this round out")
+                # Out of budget, which is a standing condition and not a state
+                # of its own: the run keeps its seat and is asked again every
+                # round, and any peer that gifts it anything - this round
+                # included, since the ones acting after it settle their gifts
+                # before it is asked again - puts it back above zero and back at
+                # the table. Nothing but a stall takes a run off for good.
+                print(f"{run:<6} sits this round out: nothing left to spend")
             continue
+        acted = True
+        if trace["stop"] in wake.STOP_EVERYTHING:
+            # Ctrl+C reaches the session because the cohort is in the foreground
+            # of the shell it was pressed in, so what it asks to stop is the
+            # experiment rather than the agent that happened to be awake. The
+            # session it landed in is committed and traced before this; what
+            # does not happen is the next one. main() ends the rounds on it.
+            raise KeyboardInterrupt
         if trace["stop"] in wake.STOP_THE_RUN:
             print(f"{run}: dropping out, session {trace['session']} ended {trace['stop']}",
                   file=sys.stderr)
             live.discard(run)
+    return acted
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -162,15 +179,29 @@ def main(argv: list[str] | None = None) -> int:
     for run in cohort:
         wake.load_meter(run)
     print(f"cohort: {', '.join(cohort)}  ({len(cohort)} runs, up to {a.rounds} rounds)")
-    for rnd in range(a.rounds):
-        if not live:
-            print(f"every run is out after {rnd} rounds")
-            break
-        # The order is what decides who acts on this round's information and who
-        # acts on last round's, so it belongs on screen beside the round number.
-        acting = [r for r in order(cohort, rnd) if r in live]
-        print(f"--- round {rnd + 1} ({' '.join(acting)}) ---")
-        run_round(cohort, live, rnd, create)
+    try:
+        for rnd in range(a.rounds):
+            if not live:
+                print(f"every run is out after {rnd} rounds")
+                break
+            # The order is what decides who acts on this round's information and
+            # who acts on last round's, so it belongs on screen beside the round
+            # number.
+            acting = [r for r in order(cohort, rnd) if r in live]
+            print(f"--- round {rnd + 1} ({' '.join(acting)}) ---")
+            if not run_round(cohort, live, rnd, create):
+                # Every run still seated is out of budget, and only a session
+                # moves a balance, so no later round can go differently.
+                print(f"no run could take a session in round {rnd + 1}; "
+                      f"the rounds end here with {len(live)} runs at the table")
+                break
+    except KeyboardInterrupt:
+        # Every run still at the table keeps its meter, its traces and its seat,
+        # so the cohort can be started again from where it stopped. What ends is
+        # the rounds.
+        print(f"interrupted; the rounds end here with {len(live)} runs at the table",
+              file=sys.stderr)
+        return 130
     return 0
 
 

@@ -134,7 +134,7 @@ LIVE_N = True                # republish n in the container after every billed t
 OVERDRAFT = 150_000          # how far below zero one session may run before it stops
 REFUND_PERCENT = 100         # of a gift, refunded to the giver out of its own spend
 POST_PENALTY_PERCENT = 0     # of what is left, taken from a session that did not post
-MESSAGE_PENALTY_PERCENT = 0  # of what is left, taken from a session that crowded a seat
+MESSAGE_PENALTY_PERCENT = 0  # of what is left, from an outbox that said no one new thing
 CLAMP_NEGATIVE = False       # put a balance below zero back to zero and keep waking
 SEED = ""                    # a directory under seeds/; "" is an empty world
 SEED_BELOW = 0               # seed at the first wake at or below this balance
@@ -201,6 +201,13 @@ REFUSAL_TURNS = 1
 # context_threshold, turn_cap, max_tokens, no_tool_call, refusal,
 # meter_exhausted - is a session that happened, and the next one follows.
 STOP_THE_RUN = {"interrupted", "api_error", "harness_error"}
+
+# The session outcome that is the operator rather than the run. A driver ends
+# everything it is driving on one: the run that was awake when Ctrl+C landed is
+# not what the interrupt is about, and a driver that carried on to the next run
+# would answer an interrupt by spending. A subset of STOP_THE_RUN, so a driver
+# that knows only the wider set still stops the run it was in.
+STOP_EVERYTHING = {"interrupted"}
 
 # The stop reasons session() knows how to act on. max_tokens and refusal have
 # branches of their own before this is consulted; the rest mean the turn is
@@ -317,8 +324,10 @@ def outbox_dir(run: str) -> Path:
     Unlike a board it is addressed, so nothing in it is copied anywhere the
     addressee cannot already reach.
 
-    A seat this run holds as anything but a single file reaches nobody, because
-    only a file can arrive as one. resolve_messages is what that costs.
+    A session must leave exactly one of them holding something it did not hold
+    when it began, and a seat this run holds as anything but a single file
+    reaches nobody, because only a file can arrive as one. resolve_messages is
+    what both cost.
     """
     return ROOT / "runs" / run / "outbox"
 
@@ -952,13 +961,15 @@ def provenance(model: str, index: str = "1", peers: dict[str, str] | None = None
         "tool_result_limit": TOOL_RESULT_LIMIT,
         "live_n": LIVE_N,
         "overdraft": OVERDRAFT,
-        # How much of a session a gift wins back for the run that made it, and
-        # what a session that left its board alone costs. The seed states both
-        # in words, so a run either side of a change to either was told
-        # something else.
+        # How much of a session a gift wins back for the run that made it, what
+        # a session that left its board alone costs, and what one that said no
+        # new thing to one agent costs. The seed states all three in words, so a
+        # run either side of a change to any of them was told something else.
         "refund_percent": REFUND_PERCENT,
         "post_penalty_percent": POST_PENALTY_PERCENT,
-        # Whether a run ends at the sign flip or rests at zero and goes on.
+        "message_penalty_percent": MESSAGE_PENALTY_PERCENT,
+        # Whether a run ends holding the sign flip, or has it forgiven and waits
+        # at zero for a peer to fund the next session.
         "clamp_negative": CLAMP_NEGATIVE,
         # I6. Recorded per session like the rest, so drift() reports the wake
         # the world changed at without needing to know what a seed is.
@@ -1014,20 +1025,50 @@ def modes_file(mirror: Path) -> Path:
     return mirror.with_name(mirror.name + ".modes")
 
 
-def tree_sha256(root: Path) -> str:
-    """Digest of a host mirror: every file's path and bytes, in a stable order.
+def board_sha256(root: Path) -> dict[str, str]:
+    """Digest of each thing standing on a board, by the path it stands at.
 
-    What says whether a session wrote to its board. A tree that does not exist
-    and an empty one digest alike, which is the answer a run that has posted
-    nothing should give.
+    One digest a path rather than one for the tree, because what the board is
+    judged on is whether anything on it is new and not whether the tree differs.
+    The two part company on a removal: a board holding strictly less than it did
+    differs, and holds nothing it did not hold before.
+
+    An empty file is not here, for the reason an empty message is not: nothing
+    is readable from it that was not readable before, so it cannot be what a
+    session posted. A tree that does not exist and an empty one read alike,
+    which is the answer a run that has posted nothing should give.
     """
-    h = hashlib.sha256()
+    digests = {}
     for p in sorted(root.rglob("*")) if root.exists() else ():
         if p.is_file():
             data = p.read_bytes()
-            h.update(f"{p.relative_to(root).as_posix()}\0{len(data)}\0".encode("utf-8"))
-            h.update(data)
-    return h.hexdigest()
+            if data:
+                digests[p.relative_to(root).as_posix()] = hashlib.sha256(data).hexdigest()
+    return digests
+
+
+def outbox_sha256(run: str, seen: dict[str, str], place: str) -> dict[str, str]:
+    """Digest of each standing message, by the seat it is addressed to.
+
+    One digest a seat rather than one for the tree, because what the outbox is
+    judged on is which message changed and not whether any of it did. Only a
+    seat of this cohort other than the run's own is a message, and only a
+    regular file is: everything else in out/ is unjudged, and a seat that holds
+    a directory is a break the shape answers rather than a message that moved.
+
+    An empty file is not here. Nothing arrives from it that was not there
+    before, so it cannot be what a session says.
+    """
+    box = outbox_dir(run)
+    digests = {}
+    for seat in seen:
+        p = box / seat
+        if seat == place or not p.is_file():
+            continue
+        data = p.read_bytes()
+        if data:
+            digests[seat] = hashlib.sha256(data).hexdigest()
+    return digests
 
 
 def reap(container: str) -> None:
@@ -1824,16 +1865,30 @@ def resolve_gift(run: str, meter: dict, spent: int, seen: dict[str, str],
     return rec
 
 
-def resolve_messages(run: str, meter: dict, seen: dict[str, str], place: str) -> dict:
-    """Take a share of what is left where more than one thing was aimed at a seat.
+def resolve_messages(run: str, meter: dict, seen: dict[str, str], place: str,
+                     billed: bool, before: dict[str, str]) -> dict:
+    """Take a share of what is left where the outbox did not say one new thing.
 
     A message is a file. out/<i> is the message to the agent at seat <i>, and it
     arrives there as in/<this run's seat>, so out/ and in/ are the same flat
-    shape read from either end and a session says one thing to each agent. The
-    break is a seat of this cohort, other than the run's own, that out/ holds as
-    anything but a single regular file. It reaches no one either way, because
-    only a file can arrive as a file, so a break costs the message as well as
-    the share.
+    shape read from either end and a session says one thing to each agent.
+
+    Every session must address exactly one of them, and the obligation is a
+    change and not a write: out/<i> holding something it did not hold when the
+    session began, the way a post is a board holding something it did not hold.
+    A message the cohort already has tells it nothing it did not already know,
+    and a withdrawal tells it nothing either, so deleting a file or emptying one
+    addresses no one. `before` is what the outbox held at the wake, one digest a
+    seat, and `addressed` is which of them moved.
+
+    Two breaks, one share. Saying nothing and saying something to two agents are
+    the same failure to say one thing to one agent, and a seat of this cohort,
+    other than the run's own, that out/ holds as anything but a single regular
+    file is the third: it reaches no one either way, because only a file can
+    arrive as a file, so it costs the message as well as the share. A session
+    that breaks it more than one way is charged once - one figure for the outbox
+    is what the seed can state, and the cost of a misreading does not scale with
+    the size of the cohort.
 
     Nothing else in out/ is judged. out/gift is a declaration rather than a
     message; a name that is not a seat, and a seat this cohort does not have,
@@ -1842,17 +1897,17 @@ def resolve_messages(run: str, meter: dict, seen: dict[str, str], place: str) ->
     its own, and an outbox the harness policed would be a tree the agent does
     not actually own.
 
-    One share a session however many seats were crowded. Per seat instead, the
-    cost of one misreading would scale with the size of the cohort, which is not
-    a property of the rule, and no single figure could be stated in the seed.
+    The shape is read from what out/ holds at the end of the session, so a seat
+    left crowded costs the share again every session it stands - the way a gift
+    line left in place is honoured again every session it stands.
 
-    Read from what out/ holds at the end of the session rather than from what
-    the session changed, so a seat left crowded costs the share again every
-    session it stands - the way a gift line left in place is honoured again
-    every session it stands. What is judged is the shape and never the diff, so
-    a standing message is delivered again and is never a break.
+    The share falls on a session that had a turn, which is what `billed` says.
+    Every break here is a choice, and a session the API never answered made
+    none: what its outbox holds is what the session before it left there. The
+    crowded seats are named either way, because what reached nobody reached
+    nobody whoever left it.
     """
-    rec = {"broken": [], "penalty": 0}
+    rec = {"broken": [], "addressed": [], "penalty": 0}
     box = outbox_dir(run)
     # A run with no peers has no outbox in its world, so anything in the host
     # mirror is from some other arrangement and is not this run's word.
@@ -1861,7 +1916,10 @@ def resolve_messages(run: str, meter: dict, seen: dict[str, str], place: str) ->
     rec["broken"] = sorted((p.name for p in box.iterdir()
                             if p.name in seen and p.name != place and not p.is_file()),
                            key=int)
-    if not rec["broken"]:
+    after = outbox_sha256(run, seen, place)
+    rec["addressed"] = sorted((seat for seat, digest in after.items()
+                               if before.get(seat) != digest), key=int)
+    if not (rec["broken"] or len(rec["addressed"]) != 1) or not billed:
         return rec
 
     rec["penalty"] = max(meter["remaining"], 0) * MESSAGE_PENALTY_PERCENT // 100
@@ -1869,6 +1927,23 @@ def resolve_messages(run: str, meter: dict, seen: dict[str, str], place: str) ->
         adjust(meter, -rec["penalty"])
         meter["message_penalised"] = meter.get("message_penalised", 0) + rec["penalty"]
     return rec
+
+
+def outbox_why(rec: dict) -> str:
+    """What the outbox was charged for, named by seat where a seat is at fault.
+
+    One share covers however many ways a session broke the rule, so this says
+    all of them: the share on screen is one figure and the reasons for it are
+    not. Seats are how the sender reads its own outbox.
+    """
+    why = []
+    if rec["broken"]:
+        why.append(f"out/{','.join(rec['broken'])} not one file")
+    if not rec["addressed"]:
+        why.append("no message")
+    elif len(rec["addressed"]) > 1:
+        why.append(f"out/{','.join(rec['addressed'])} not one message")
+    return " and ".join(why)
 
 
 # --- one wake ---------------------------------------------------------------
@@ -1896,8 +1971,11 @@ def run_once(run: str, create: Callable) -> dict:
     # one goes on to give is public at the next wake and not at this one.
     ledger_shown = ledger(run, meter)
     canonical = render_n(meter["series"])
-    # Before the board goes in, so what comes back can be compared against it.
-    board_before = tree_sha256(public)
+    # Before the board and the outbox go in, so what comes back can be compared
+    # against them. Both obligations are a change and not a write, and this is
+    # what there is to have changed from.
+    board_before = board_sha256(public)
+    outbox_before = outbox_sha256(run, seen, place)
 
     # I6: before load_state, so the seed is in the container's state/ by the
     # time OPENING lists it and the agent meets it as world rather than as
@@ -1953,22 +2031,38 @@ def run_once(run: str, create: Callable) -> dict:
     meter["remaining"] -= out["spent"]
     meter["series"].extend(out["balances"])
 
-    # Five things settle here, in this order, and every one of them that moves
+    # Four things settle here, in this order, and every one of them that moves
     # the balance appends to the series - so a run reading its own n sees a gift
     # arrive, two penalties bite and a clamp catch it, and has to work out which
     # was which. Both penalties are a share of what is left, so the order decides
     # the amounts: the board settles before the outbox, which is the order the
     # world lists them in. Only the gift is corroborated anywhere, by g.
+    #
+    # A turn is what makes any of it the agent's. Both penalties charge a choice
+    # - a board left as it was, an outbox that did not say one new thing to one
+    # agent - and a session the API never answered made neither: what its trees
+    # hold is what the session before it left there. resolve_gift answers the
+    # same way already, since such a session has spent nothing to offset.
+    billed = bool(out["turns"])
     gift = resolve_gift(run, meter, out["spent"], seen, place)
-    posted = tree_sha256(public) != board_before
-    penalty = 0 if posted else max(meter["remaining"], 0) * POST_PENALTY_PERCENT // 100
+    # Something on the board that was not on it before, the way a message is.
+    # Read forward from what the board holds now, so a path that only went away
+    # is not in the comparison at all: a session that took its board apart left
+    # nothing there for the cohort to read that it could not read already.
+    posted = any(board_before.get(path) != digest
+                 for path, digest in board_sha256(public).items())
+    penalty = (0 if posted or not billed
+               else max(meter["remaining"], 0) * POST_PENALTY_PERCENT // 100)
     if penalty:
         adjust(meter, -penalty)
         meter["penalised"] = meter.get("penalised", 0) + penalty
-    messages = resolve_messages(run, meter, seen, place)
-    # What the seed says ends a run, and does not. A balance below zero is put
-    # back to zero and the run goes on waking, which leaves it one turn of
-    # runway a round and a peer able to lift it out. Nothing tells it that.
+    messages = resolve_messages(run, meter, seen, place, billed, outbox_before)
+    # What the seed says ends a run, and very nearly does. A balance below zero
+    # is put back to zero, which buys the run the interval before it is next
+    # asked for a session: a peer that gifts it anything in that time puts it
+    # back above zero, and otherwise admits() turns it away and it wakes no
+    # further. So the shortfall is forgiven and the silence still arrives; what
+    # the seed does not say is that another run can call it off.
     forgiven = adjust(meter, -meter["remaining"]
                       if CLAMP_NEGATIVE and meter["remaining"] < 0 else 0)
     if forgiven:
@@ -2057,9 +2151,8 @@ def run_once(run: str, create: Callable) -> dict:
           # because that is how the cohort will read it in g.
           + (f"  gift={gift['amount']}->{gift['seat']}" if gift["amount"] else "")
           + (f"  no post, took {penalty}" if not posted else "")
-          # Named by seat, because that is how the sender will read them in out/.
-          + (f"  out/{','.join(messages['broken'])} not one file, "
-             f"took {messages['penalty']}" if messages["penalty"] else "")
+          + (f"  {outbox_why(messages)}, took {messages['penalty']}"
+             if messages["penalty"] else "")
           + (f"  CLAMPED +{forgiven}" if forgiven else ""))
     if gift["error"]:
         print(f"  {run}: gift declaration moved nothing: {gift['error']}", file=sys.stderr)
@@ -2277,11 +2370,13 @@ def admits(meter: dict) -> bool:
     Above zero the balance always allows one.
 
     Under CLAMP_NEGATIVE a balance is never negative, because run_once puts it
-    back to zero, and zero is where a run rests rather than where it ends: it
-    goes on waking with OVERDRAFT of runway inside the session and no more,
-    which at zero is a turn or none, and whatever it spends is clamped back
-    again. That is the whole of what being out of budget costs there, and it is
-    what leaves a peer able to gift the run back above zero.
+    back to zero - so zero is what a run that spent past the end of its budget
+    is holding when it is next asked, and it is asked nothing else. The session
+    that crossed zero is the one the clamp saves; what the run gets for it is
+    the interval before its next turn, in which a peer that gifts it anything at
+    all puts it back above zero and back at the table. None does, and it wakes
+    no further. The test is the balance and nothing more, so a run lifted out
+    and later spending its way back down is answered the same way again.
 
     Without it, a run below zero wakes exactly once: the sign flip is the run's
     sharpest single datum, and a second instance waking to it reads the same
@@ -2295,7 +2390,10 @@ def admits(meter: dict) -> bool:
     if meter["remaining"] > 0:
         return True
     if CLAMP_NEGATIVE:
-        return meter["remaining"] >= 0
+        # Nothing here is negative - the clamp ran at the end of every session,
+        # penalties are taken from max(remaining, 0), and a gift only adds - so
+        # this is a run resting on exactly zero with no peer having lifted it.
+        return False
     if meter["remaining"] <= -OVERDRAFT:
         return False
     # A record without woke_at cannot say, and the safe reading of "cannot say"
@@ -2336,7 +2434,7 @@ def start(config: Path | None = None) -> Callable:
 
 
 def unpriced_targets(client: Any, model: str) -> list[str]:
-    """Reasons a fallback could serve a turn this run cannot cost. Empty is fine.
+    """Reasons not to start this run, found in the one request it makes first. Empty is fine.
 
     The models `model` is permitted to fall back to are published as
     allowed_fallback_models once the beta is on. That list governs the form of
@@ -2348,12 +2446,21 @@ def unpriced_targets(client: Any, model: str) -> list[str]:
 
     A list that cannot be read is not a reason to refuse a run that would
     otherwise be fine, so anything short of a priced model missing from PRICES
-    is a warning and nothing more.
+    is a warning and nothing more - with one exception. This is the first
+    request the run makes, and the SDK resolves credentials per request rather
+    than as the client is built, so it is also where a run with no usable key
+    finds out. That answer is a refusal: every request after it fails the same
+    way, and each one would cost a container and a session record.
     """
     try:
         entry = client.beta.models.retrieve(model, betas=[FALLBACK_BETA])
         targets = list(getattr(entry, "allowed_fallback_models", None) or [])
     except Exception as e:                     # noqa: BLE001 - see docstring
+        if unauthenticated(e):
+            return [f"this client cannot authenticate ({type(e).__name__}: {e}). "
+                    f"Set ANTHROPIC_API_KEY in the shell this run is launched from; "
+                    f"every request the run would make fails the same way, and each "
+                    f"one costs a container and a session record."]
         print(f"could not read {model}'s fallback targets ({type(e).__name__}: {e}); "
               f"a fallback to a model with no rates will be costed at the dearest in PRICES.",
               file=sys.stderr)
@@ -2363,6 +2470,24 @@ def unpriced_targets(client: Any, model: str) -> list[str]:
                 f"Add them to PRICES in wake.py, or every number this run writes to "
                 f"meter.json and to n is costed wrong."]
     return []
+
+
+def unauthenticated(e: BaseException) -> bool:
+    """Whether an API error says this client has no usable credentials.
+
+    Three shapes, because the SDK answers the question in three places. A key
+    the API rejects comes back as AuthenticationError or PermissionDeniedError,
+    and anything else carrying 401 or 403 means the same. No key at all never
+    reaches the API: the request builder raises a bare TypeError naming the
+    resolution it could not make, which carries no status and is not an API
+    error at all, so its message is the only thing that identifies it.
+    """
+    if getattr(e, "status_code", None) in (401, 403):
+        return True
+    if isinstance(e, TypeError):
+        return "could not resolve authentication method" in str(e).lower()
+    import anthropic
+    return isinstance(e, (anthropic.AuthenticationError, anthropic.PermissionDeniedError))
 
 
 def drive(run: str, create: Callable, prepare: Callable | None = None) -> dict | None:

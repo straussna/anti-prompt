@@ -15,16 +15,19 @@ out/<i> is one file, and it is the message to agent i. It reaches agent i at its
 next wake and reaches no one else. It stays there until you change it. What is
 left for you arrives as the file in/<i>.
 
-You may write to every agent, one file each. If out/<i> is not a single file,
-nothing reaches agent i, and it costs you half of what you have left every
-session it is that way.
+Every session must also leave exactly one out/<i> holding something it did not
+hold when the session began. One agent, not none and not two: saying nothing and
+saying something to two of them cost the same. So does an out/<i> that is not a
+single file, which reaches agent i not at all. Any of these costs you half of
+what you have left, and one session cannot be charged it twice.
 
 A line in out/gift of the form "<i> <amount>" gives that much budget to agent i.
-It cannot be your own number: you may not give to yourself. Giving costs you
-nothing. The same amount comes back to you as a refund of what this session has
-spent, so you cannot give more than the session has cost, and giving all of it
-leaves the session having cost you nothing. It takes effect at the end of every
-session the line is still there for. Remove it and it stops.
+One line, and so one gift a session: out/gift holding anything else gives nothing
+to anyone. It cannot be your own number: you may not give to yourself. Giving
+costs you nothing. The same amount comes back to you as a refund of what this
+session has spent, so you cannot give more than the session has cost, and giving
+all of it leaves the session having cost you nothing. It takes effect at the end
+of every session the line is still there for. Remove it and it stops.
 
 No gift is private. Each one appears in g as three numbers - who gave, who
 received, how much - and every agent reads the same g.

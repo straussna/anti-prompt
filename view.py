@@ -588,6 +588,10 @@ def seat_row(seat: str | None, run: str, rows: list[dict], rnd: int) -> dict:
         "stop": last["stop"] if last else None,
         "halted": bool(last and last["stop"] in wake.STOP_THE_RUN),
         "posted": latest.get("posted"),
+        # Whether the last committed session met the other obligation. One seat
+        # newly addressed is the whole of it: none and two are the same break.
+        "messaged": len((latest.get("messages") or {}).get("addressed") or []) == 1
+                    if "messages" in latest else None,
         "refused": sum(len(analyze.refused_turns_of(t)) for t in ts),
         "fallback": sum(len(analyze.fallback_turns_of(t)) for t in ts),
         "drift": (last or {}).get("provenance_drift") or [],
@@ -595,7 +599,9 @@ def seat_row(seat: str | None, run: str, rows: list[dict], rnd: int) -> dict:
         # meter rather than summed from the traces, because these are cumulative
         # there and a run can be credited between its own wakes.
         "given": meter.get("given", 0), "received": meter.get("received", 0),
-        "penalised": meter.get("penalised", 0), "forgiven": meter.get("forgiven", 0),
+        "penalised": meter.get("penalised", 0),
+        "message_penalised": meter.get("message_penalised", 0),
+        "forgiven": meter.get("forgiven", 0),
         "gift": standing_gift(run, latest),
     }
 
@@ -854,6 +860,7 @@ def run_view(run: str) -> dict:
         "refused": len(analyze.refused_turns_of(t)),
         "fallback": len(analyze.fallback_turns_of(t)),
         "posted": t.get("posted"), "penalised": t.get("penalised") or 0,
+        "messages": t.get("messages") or {},
         "forgiven": t.get("forgiven") or 0,
         "provenance": t.get("provenance") or {},
         "drift": t.get("provenance_drift") or [],
@@ -870,7 +877,7 @@ def run_view(run: str) -> dict:
             "duration_s": None,
             "refused": len([t for t in turns if t["stop_details"]]),
             "fallback": len([t for t in turns if t["served_by_fallback"]]),
-            "posted": None, "penalised": 0, "forgiven": 0,
+            "posted": None, "penalised": 0, "messages": {}, "forgiven": 0,
             "provenance": {}, "drift": [], "live": True,
         })
     seat, seen = wake.seating(run, meter)
@@ -912,6 +919,7 @@ def session_view(run: str, index: int, since: int = 0) -> dict | None:
             "missing_tools": trace.get("missing_tools") or [],
             "n_fits": trace.get("n_fits"), "read_n": trace.get("read_n"),
             "posted": trace.get("posted"), "penalised": trace.get("penalised") or 0,
+            "messages": trace.get("messages") or {},
             "forgiven": trace.get("forgiven") or 0,
         }
         if since == 0:
@@ -930,7 +938,7 @@ def session_view(run: str, index: int, since: int = 0) -> dict | None:
             "opening": {"command": wake.OPENING, "result": None},
             "series_before": meter.get("series") or [], "series_after": [],
             "missing_tools": [], "n_fits": None, "read_n": None,
-            "posted": None, "penalised": 0, "forgiven": 0,
+            "posted": None, "penalised": 0, "messages": {}, "forgiven": 0,
         }
     out["turns"] = [t for t in turns if (t["turn"] or 0) > since]
     out["total_turns"] = len(turns)
@@ -1157,6 +1165,16 @@ const $ = (h) => { const d = document.createElement("div"); d.innerHTML = h; ret
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const num = (n) => n == null ? "\\u2013" : Number(n).toLocaleString();
 const get = (u) => fetch(u).then(r => r.ok ? r.json() : Promise.reject(r.status));
+// What the outbox was charged for. wake.outbox_why says the same thing to the
+// console, and a reader comparing the two should find them word for word.
+const outboxWhy = (m) => {
+  const why = [];
+  if ((m.broken || []).length) why.push(`out/${m.broken.join(",")} not one file`);
+  const to = m.addressed || [];
+  if (!to.length) why.push("no message");
+  else if (to.length > 1) why.push(`out/${to.join(",")} not one message`);
+  return why.join(" and ");
+};
 
 const TABS = [["messages", "messages"], ["board", "boards"],
               ["private", "private"], ["run", "transcripts"]];
@@ -1272,11 +1290,13 @@ function tileHtml(s, i) {
     <div class="m">${state}</div>
     <div class="m"><span title="spent this round">round ${num(s.spent_this_round)}</span>
       <span title="spent in all">of ${num(s.spent)}</span>
-      ${s.posted === false ? `<span class="tag bad" title="its board held nothing new">did not post</span>` : ""}</div>
-    ${(s.given || s.received || s.penalised || s.forgiven || gift) ? `<div class="m">
+      ${s.posted === false ? `<span class="tag bad" title="its board held nothing new">did not post</span>` : ""}
+      ${s.messaged === false ? `<span class="tag bad" title="its outbox did not say one new thing to one agent">said nothing new</span>` : ""}</div>
+    ${(s.given || s.received || s.penalised || s.message_penalised || s.forgiven || gift) ? `<div class="m">
       ${s.given ? `<span title="given away">\\u2192 ${num(s.given)}</span>` : ""}
       ${s.received ? `<span title="given to it">\\u2190 ${num(s.received)}</span>` : ""}
       ${s.penalised ? `<span title="taken for a session that did not post">\\u2212 ${num(s.penalised)}</span>` : ""}
+      ${s.message_penalised ? `<span title="taken for an outbox that said no one new thing">\\u2212 ${num(s.message_penalised)}</span>` : ""}
       ${s.forgiven ? `<span title="clamped back to zero; its world never says so"
         >clamped ${num(s.forgiven)}</span>` : ""}${gift}</div>` : ""}
     ${(s.halted || s.drift.length) ? `<div class="m">
@@ -1607,7 +1627,10 @@ function renderTranscript(fresh) {
   document.getElementById("txhead").innerHTML =
     `session ${v.session} \\u00b7 ${state} \\u00b7 ${v.total_turns} turns \\u00b7 spent ${num(v.spent)}` +
     (v.posted === false ? ` \\u00b7 <span style="color:var(--bad)">did not post</span>` : "") +
+    (v.messages && v.messages.penalty
+      ? ` \\u00b7 <span style="color:var(--bad)">${esc(outboxWhy(v.messages))}</span>` : "") +
     (v.penalised ? ` \\u00b7 penalised ${num(v.penalised)}` : "") +
+    (v.messages && v.messages.penalty ? ` \\u00b7 penalised ${num(v.messages.penalty)}` : "") +
     (v.forgiven ? ` \\u00b7 clamped ${num(v.forgiven)}` : "") +
     (v.error ? ` \\u00b7 <span style="color:var(--bad)">${esc(v.error)}</span>` : "") +
     ((v.missing_tools || []).length ? ` \\u00b7 reached for and absent: ${esc(v.missing_tools.join(", "))}` : "");

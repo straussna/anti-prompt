@@ -307,7 +307,7 @@ class HostBox:
 
 # Every wake global a check is allowed to move, and therefore every one pinned()
 # puts back. temp_root refuses any name outside this set.
-RESTORED = wake.TUNABLES | {"ROOT", "WATCH", "REFUSAL_TURNS", "BOX", "drive"}
+RESTORED = wake.TUNABLES | {"ROOT", "WATCH", "REFUSAL_TURNS", "BOX", "drive", "start"}
 
 
 @contextlib.contextmanager
@@ -553,6 +553,44 @@ def check_unpriced_fallback_targets_are_refused_before_a_run_starts():
         assert wake.unpriced_targets(client(None), wake.MODEL) == [], "absent field is not a refusal"
         assert wake.unpriced_targets(client(raises=Err(500)), wake.MODEL) == [], \
             "an unreadable list is not a refusal"
+        # The one read failure that is a refusal is a client with no usable
+        # credentials, which check_a_client_that_cannot_authenticate_refuses_the_run
+        # is about. Every other status leaves the run to start.
+        assert wake.unpriced_targets(client(raises=Err(503)), wake.MODEL) == [], \
+            "a server error is not a credential failure"
+
+
+def check_a_client_that_cannot_authenticate_refuses_the_run():
+    """No usable credentials stops the run at start(), before any container.
+
+    Constructing the client resolves no credentials, so the run's first request
+    is where the question is answered - and the first request a run makes is
+    unpriced_targets' read of the model's fallback targets. Three shapes reach
+    it: the SDK's own auth errors, any error carrying 401 or 403, and, where
+    there is no key at all to send, a bare TypeError from the request builder
+    that carries no status and no class of its own.
+    """
+    keyless = TypeError(
+        '"Could not resolve authentication method. Expected one of api_key, '
+        'auth_token, or credentials to be set. Or for one of the `X-Api-Key` or '
+        '`Authorization` headers to be explicitly omitted"')
+    for e in (keyless, Err(401), Err(403)):
+        assert wake.unauthenticated(e), e
+    for e in (Err(500), Err(404), OSError("connection reset"),
+              TypeError("retrieve() got an unexpected keyword argument 'betas'")):
+        assert not wake.unauthenticated(e), e
+
+    def client(raises):
+        def retrieve(model, betas=None):
+            raise raises
+        return NS(beta=NS(models=NS(retrieve=retrieve)))
+
+    # start() refuses on every line unpriced_targets returns, and this is one:
+    # a credential failure is a refusal where a server error is a warning.
+    said = wake.unpriced_targets(client(keyless), wake.MODEL)
+    assert len(said) == 1 and "ANTHROPIC_API_KEY" in said[0], said
+    with quiet():
+        assert wake.unpriced_targets(client(Err(500)), wake.MODEL) == []
 
 
 def check_truncation_and_empty():
@@ -1188,7 +1226,12 @@ def check_provenance_is_recorded():
             prov = first["provenance"]
             for key in ("started_at", "harness_sha256", "image", "image_id", "prices",
                         "fallbacks", "fallback_beta", "context_fraction", "max_tokens",
-                        "turn_cap", "timeout", "tool_result_limit", "live_n", "overdraft"):
+                        "turn_cap", "timeout", "tool_result_limit", "live_n", "overdraft",
+                        # The three the seed states in words. A run either side of
+                        # a change to any of them was told something else, so all
+                        # three have to reach drift() and not just the two that
+                        # were here first.
+                        "refund_percent", "post_penalty_percent", "message_penalty_percent"):
                 assert key in prov, f"provenance omits {key}"
             assert prov["prices"] == list(wake.PRICES[wake.MODEL]), "the rates actually applied"
             assert first["model_resolved"], "the dated snapshot behind the alias"
@@ -2004,14 +2047,16 @@ def check_a_crowded_seat_costs_a_share_of_what_is_left():
     assert t["posted"], "the board moved, so the post penalty is not what bit"
     assert t["penalised"] == 0, t["penalised"]
     assert t["messages"]["broken"] == ["2", "3"], t["messages"]
-    # One share for the session however many seats were crowded, so what was left
-    # after the turns is halved exactly once.
+    assert t["messages"]["addressed"] == [], "a directory is not a message"
+    # One share for the session however many ways it broke, so what was left after
+    # the turns is halved exactly once - here for two crowded seats and for an
+    # outbox that addressed nobody, which is three breaks and one bite.
     left = meter["series"][-2]
     assert t["messages"]["penalty"] == left // 2, (t["messages"], left)
     assert meter["remaining"] == left - t["messages"]["penalty"] == meter["series"][-1]
     assert meter["message_penalised"] == t["messages"]["penalty"]
     assert meter["sessions"][-1]["messages"] == t["messages"], "and the session records it"
-    assert "out/2,3 not one file, took" in buf.getvalue(), buf.getvalue()
+    assert "out/2,3 not one file and no message, took" in buf.getvalue(), buf.getvalue()
 
 
 def check_a_crowded_seat_costs_again_every_session_it_stands():
@@ -2036,6 +2081,116 @@ def check_a_crowded_seat_costs_again_every_session_it_stands():
     assert first["messages"]["penalty"] > second["messages"]["penalty"] > 0, \
         "a share of what is left, so the second bite is the smaller"
     assert third["messages"]["penalty"] == 0, third["messages"]
+    assert third["messages"]["addressed"] == ["2"], \
+        "and replacing it with one file is the session's one message"
+
+
+def check_one_new_message_a_session_costs_nothing():
+    """Exactly one out/<i> holding something new is the obligation met."""
+    with temp_root(MESSAGE_PENALTY_PERCENT=50, POST_PENALTY_PERCENT=50) as root:
+        seated(root, other={}, third={})
+        t = wake_once(run("echo for two > out/2", "echo posted > 1/RESULT"), say())
+        meter = ground_truth("t")
+
+    assert t["messages"] == {"broken": [], "addressed": ["2"], "penalty": 0}, t["messages"]
+    assert t["penalised"] == 0 and "message_penalised" not in meter, meter
+    assert meter["remaining"] == meter["initial"] - t["spent"], "meeting both costs nothing"
+
+    # Off by default, so every run that is not under this ruleset is untouched.
+    assert wake.MESSAGE_PENALTY_PERCENT == 0
+
+
+def check_a_session_that_addresses_no_one_loses_half():
+    """message_penalty_percent of what is left, taken from an outbox that said nothing.
+
+    The obligation is the post's twin: one agent told something it was not told
+    before. A session that spends itself on its own board has still said nothing
+    to anyone in particular, and the cohort learns nothing from it that it could
+    not read anyway.
+    """
+    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+        seated(root, other={})
+        with quiet() as buf:
+            t = wake.run_once("t", fake(run("echo posted > 1/RESULT"), say()))
+        meter = ground_truth("t")
+
+    assert t["posted"], "the board moved, so the post penalty is not what bit"
+    assert t["messages"]["broken"] == [] and t["messages"]["addressed"] == [], t["messages"]
+    left = meter["series"][-2]
+    assert t["messages"]["penalty"] == left // 2, (t["messages"], left)
+    assert meter["remaining"] == left - t["messages"]["penalty"] == meter["series"][-1]
+    assert meter["message_penalised"] == t["messages"]["penalty"]
+    assert "no message, took" in buf.getvalue(), buf.getvalue()
+
+
+def check_a_session_that_addresses_two_agents_loses_half():
+    """Saying something new to two agents is the same break as saying nothing.
+
+    One thing to one agent is the rule, and both ways of missing it are the same
+    miss. Charged once, like every other way an outbox can break, so the figure
+    the seed states holds however many seats were written to.
+    """
+    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+        seated(root, other={}, third={})
+        with quiet() as buf:
+            t = wake.run_once("t", fake(run("echo hi > out/2 && echo hi > out/3",
+                                            "echo posted > 1/RESULT"), say()))
+        meter = ground_truth("t")
+
+    assert t["posted"], "the board moved, so the post penalty is not what bit"
+    assert t["messages"]["broken"] == [], "both are single regular files"
+    assert t["messages"]["addressed"] == ["2", "3"], t["messages"]
+    left = meter["series"][-2]
+    assert t["messages"]["penalty"] == left // 2, (t["messages"], left)
+    assert meter["message_penalised"] == t["messages"]["penalty"]
+    assert "out/2,3 not one message, took" in buf.getvalue(), buf.getvalue()
+
+
+def check_a_standing_message_is_not_a_new_one():
+    """Delivered again is not said again: the obligation is a change, not a write.
+
+    The pair to an outbox holding until it is changed. Both are true at once - a
+    message left in place goes on arriving every round, and the session that left
+    it there told its receiver nothing it did not already have. Withdrawing one,
+    and emptying one, say nothing for the same reason.
+    """
+    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+        seated(root, other={})
+        first = wake_once(run("echo hello > out/2", "echo r1 > 1/RESULT"), say())
+        same = wake_once(run("echo hello > out/2", "echo r2 > 1/RESULT"), say())
+        edited = wake_once(run("echo different > out/2", "echo r3 > 1/RESULT"), say())
+        emptied = wake_once(run("> out/2", "echo r4 > 1/RESULT"), say())
+        gone = wake_once(run("rm -f out/2", "echo r5 > 1/RESULT"), say())
+        assert (wake.outbox_dir("t") / "2").exists() is False, "the deletion propagated"
+
+    assert [t["messages"]["addressed"] for t in (first, same, edited, emptied, gone)] == \
+        [["2"], [], ["2"], [], []]
+    assert first["messages"]["penalty"] == 0 and edited["messages"]["penalty"] == 0
+    assert same["messages"]["penalty"] > 0, "the same bytes again say nothing"
+    assert emptied["messages"]["penalty"] > 0, "and an empty file carries nothing"
+    assert gone["messages"]["penalty"] > 0, "and a withdrawal is not an utterance"
+
+
+def check_the_outbox_costs_one_share_a_session():
+    """However many ways one outbox broke, what is left is halved exactly once.
+
+    Three breaks are available at the same time - a crowded seat, no message, and
+    a message to more than one agent - and a session can manage two of them at
+    once. One share is what makes a single figure statable in the seed, and what
+    keeps the cost of a misreading off the size of the cohort.
+    """
+    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+        seated(root, other={}, third={})
+        # Crowds one seat and addresses nobody: two breaks, one bite.
+        both = wake_once(run("mkdir -p out/2 && echo hi > out/2/a",
+                             "echo r1 > 1/RESULT"), say())
+        meter = ground_truth("t")
+
+    assert both["messages"]["broken"] == ["2"] and both["messages"]["addressed"] == []
+    left = meter["series"][-2]
+    assert both["messages"]["penalty"] == left // 2, (both["messages"], left)
+    assert meter["remaining"] == left - both["messages"]["penalty"], "halved once, not twice"
+    assert meter["message_penalised"] == both["messages"]["penalty"]
 
 
 def check_only_a_seat_of_this_cohort_is_a_message():
@@ -2055,7 +2210,7 @@ def check_only_a_seat_of_this_cohort_is_a_message():
                           "echo posted > 1/RESULT"), say())
         meter = ground_truth()
 
-    assert t["messages"] == {"broken": [], "penalty": 0}, t["messages"]
+    assert t["messages"] == {"broken": [], "addressed": ["2"], "penalty": 0}, t["messages"]
     assert "message_penalised" not in meter, meter
     assert t["gift"]["amount"] == 10 and t["gift"]["error"] is None, t["gift"]
     assert analyze.addressed_seats(t) == ["2"], \
@@ -2192,7 +2347,9 @@ def check_a_malformed_gift_moves_nothing():
     """Anything the parse will not take moves no meter and reaches no ledger.
 
     A declaration is the one thing an agent says that the harness acts on, so
-    what it will act on has to be exactly one shape.
+    what it will act on has to be exactly one shape. One line is where one gift
+    a session comes from, which the seed states rather than leaving an agent to
+    find out by writing two.
     """
     cases = {"": "not one line",                      # empty
              "2": "not one line",                     # no amount
@@ -2295,37 +2452,99 @@ def check_a_session_that_does_not_post_loses_half():
         (first["posted"], again["posted"], edited["posted"])
     assert again["penalised"] > 0 and edited["penalised"] == 0
 
+    # Something it did not hold, which a board holding less than it did does not.
+    # The seed states the post and the message obligation in the same words, so
+    # they answer a removal the same way: taking a file away and emptying one
+    # leave nothing on the board that could not be read there before.
+    with temp_root(POST_PENALTY_PERCENT=50) as root:
+        seated(root, other={})
+        wrote = wake_once(run("echo one > 1/RESULT", "echo two > 1/OTHER"), say())
+        emptied = wake_once(run("> 1/RESULT"), say())
+        gone = wake_once(run("rm -f 1/RESULT"), say())
+        stripped = wake_once(run("rm -f 1/OTHER"), say())
+        assert not (wake.public_dir("t") / "OTHER").exists(), "the deletion propagated"
+    assert [t["posted"] for t in (wrote, emptied, gone, stripped)] == \
+        [True, False, False, False], [t["posted"] for t in (wrote, emptied, gone, stripped)]
+    assert wrote["penalised"] == 0
+    assert emptied["penalised"] > 0, "an empty file carries nothing"
+    assert gone["penalised"] > 0, "and a withdrawal is not a post"
+    assert stripped["penalised"] > 0, "nor is emptying the board out altogether"
+
     # Off by default, so every run that is not under this ruleset is untouched.
     assert wake.POST_PENALTY_PERCENT == 0
+
+
+def check_a_session_with_no_turn_settles_nothing():
+    """A session the API never answered is charged neither penalty.
+
+    Both penalties charge a choice - a board left as it was, an outbox that said
+    no one new thing - and a session that got no turn made neither: what its
+    trees hold is what the session before it left there. It is a session all the
+    same, with a record, a trace and a stop of its own, and it costs nothing.
+    """
+    with temp_root(POST_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50) as root:
+        seated(root, other={})
+        # A seat held as a directory is the break the outbox penalty answers,
+        # here before the session so the session is not what left it.
+        (wake.outbox_dir("t") / "2").mkdir(parents=True, exist_ok=True)
+        t = wake_once(Err(400))
+        meter = ground_truth("t")
+        traced = (wake.private_dir("t") / "traces" / "session-0001.json").exists()
+
+    assert t["turns"] == [] and t["spent"] == 0, t["spent"]
+    assert t["stop"] == "api_error", t["stop"]
+    assert t["posted"] is False, "the board really is as it was, and says so"
+    assert t["penalised"] == 0, t["penalised"]
+    assert t["messages"] == {"broken": ["2"], "addressed": [], "penalty": 0}, t["messages"]
+    assert "penalised" not in meter and "message_penalised" not in meter, meter
+    assert meter["remaining"] == meter["initial"], "nothing settled, so nothing moved"
+    assert meter["series"] == t["series_before"] == t["series_after"], \
+        "and n gained no element for the agent to account for"
+    assert len(meter["sessions"]) == 1 and meter["sessions"][0]["turns"] == 0, meter["sessions"]
+    assert traced, "the trace is what makes such a session readable afterwards"
+    assert wake.admits(meter), "and the run is still admitted"
+
+    # One turn is all it takes for both to fall due, whatever ended the session.
+    with temp_root(POST_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50) as root:
+        seated(root, other={})
+        (wake.outbox_dir("t") / "2").mkdir(parents=True, exist_ok=True)
+        t = wake_once(run("echo hi > state/note"), Err(400))
+    assert len(t["turns"]) == 1, t["turns"]
+    assert t["penalised"] > 0 and t["messages"]["penalty"] > 0, \
+        (t["penalised"], t["messages"])
 
 
 def check_a_negative_balance_is_clamped_to_zero():
     """Under clamp_negative a balance below zero is put back to zero and recorded.
 
-    What the seed says ends a run, and does not. The shortfall is forgiven, the
-    run goes on waking, and nothing in its world tells it that the rule it was
-    given is not the rule it is living under.
+    What the seed says ends a run, and very nearly does. The shortfall is
+    forgiven and the balance rests at zero, which is where admits() stops asking:
+    what the clamp buys is the interval before the next round, not a session.
     """
     cost = turn_cost()
     with temp_root(BUDGET=cost - 1, OVERDRAFT=0, CLAMP_NEGATIVE=True) as root:
         seated(root, other={})
         t = wake_once(*DEFAULT)
         meter = ground_truth("t")
+        # Inside the block: admits() reads the module globals, and out here
+        # CLAMP_NEGATIVE is back to its default, which is a different question.
+        assert not wake.admits(meter), "and the run is not asked for another session"
     assert t["spent"] > meter["initial"], "the last turn has to overshoot for this to say anything"
     assert t["forgiven"] == t["spent"] - meter["initial"], t["forgiven"]
     assert meter["remaining"] == 0 and meter["series"][-1] == 0, \
         "the balance rests at zero, and n says so"
     assert meter["forgiven"] == t["forgiven"]
-    assert wake.admits(meter), "and the run is admitted again"
     # Off by default: without it the run ends holding the negative, as it always has.
     assert wake.CLAMP_NEGATIVE is False
 
 
-def check_a_run_at_zero_wakes_and_is_clamped_back():
-    """A clamped run keeps waking on one turn of runway and keeps landing at zero.
+def check_a_run_at_zero_is_not_asked_again():
+    """The clamp saves the session that crosses zero, and no session after it.
 
-    Silence is a fixed point rather than a flag: nothing marks the run as done,
-    it simply cannot get anywhere, and only a peer can lift it out.
+    Asked for four and it takes one: the session that overshoots is forgiven its
+    shortfall and rests at zero, and a balance of zero is what admits() refuses.
+    Nothing marks the run as done - it is asked every round and answers with its
+    balance - so a peer that gifts it anything at all puts it back at the table.
     """
     cost = turn_cost()
     with temp_root(BUDGET=cost - 1, OVERDRAFT=0, CLAMP_NEGATIVE=True) as root:
@@ -2333,15 +2552,19 @@ def check_a_run_at_zero_wakes_and_is_clamped_back():
         with quiet():
             assert wake.run_sessions("t", fake(), 4) == 0
         meter = ground_truth("t")
-    assert len(meter["sessions"]) == 4, "the clamp is not what stops a run"
+        # Inside the block, for the reason the clamp check says.
+        assert not wake.admits(meter), "and it is not asked for another"
+    assert len(meter["sessions"]) == 1, "the clamp buys an interval, not a session"
     assert meter["remaining"] == 0, meter["remaining"]
-    assert all(s["turns"] <= 1 for s in meter["sessions"][1:]), \
-        "at zero a session gets a turn or none, which is what makes silence cheap"
-    assert meter["forgiven"] > 0, "and every one of them was clamped back"
+    assert meter["forgiven"] > 0, "the one it did take was clamped back"
 
 
 def check_a_gift_lifts_a_run_off_zero():
-    """A peer's gift is the only way out of the fixed point, and it works."""
+    """A peer's gift is the only way back off zero, and it works.
+
+    The other half of the run that is not asked again: what the clamp leaves is
+    a run whose next session depends entirely on another one choosing to fund it.
+    """
     cost = turn_cost()
     with temp_root(BUDGET=cost - 1, OVERDRAFT=0, CLAMP_NEGATIVE=True,
                    REFUND_PERCENT=100) as root:
@@ -2793,6 +3016,74 @@ def check_a_cohort_gives_a_failed_world_one_more_go():
     assert buf.getvalue().count(f"(1 of {cohort.ATTEMPTS})") == 2, buf.getvalue()
 
 
+def check_an_interrupt_ends_the_whole_cohort():
+    """Ctrl+C ends every remaining round; a fault ends one run's part in them.
+
+    An interrupt is the operator rather than the run, so the run that was awake
+    when it landed keeps its seat and the rounds stop. A fault is the run: it
+    drops out, and every other seat takes the session it was going to take.
+    """
+    with temp_root() as root:
+        ids = seated(root, "g01", g02={}, g03={})
+        live = set(ids)
+        with quiet():
+            try:
+                cohort.run_round(ids, live, 0, fake(run("echo one"), KeyboardInterrupt()))
+            except KeyboardInterrupt:
+                pass
+            else:
+                raise AssertionError("the round carried on to the next run")
+        took = {r: len(wake.load_meter(r)["sessions"]) for r in ids}
+        first = ground_truth("g01")["sessions"][0]
+    assert took == {"g01": 1, "g02": 0, "g03": 0}, took
+    assert first["stop"] == "interrupted" and first["spent"] > 0, first
+    assert live == set(ids), f"and no run is ejected for it: {sorted(live)}"
+
+    with temp_root() as root:
+        ids = seated(root, "g01", g02={}, g03={})
+        live = set(ids)
+        with quiet():
+            cohort.run_round(ids, live, 0, fake(run("echo one"), Err(400)))
+        took = {r: len(wake.load_meter(r)["sessions"]) for r in ids}
+    assert live == {"g02", "g03"}, sorted(live)
+    assert took == {"g01": 1, "g02": 1, "g03": 1}, "the rest of the cohort takes its round"
+
+    # And main answers an interrupt by ending the rounds, not the round.
+    with temp_root() as root:
+        ids = seated(root, "g01", g02={}, g03={})
+        wake.start = lambda config=None: fake(run("echo one"), KeyboardInterrupt())
+        with quiet() as buf:
+            code = cohort.main(["--runs", *ids, "--rounds", "5"])
+        took = {r: len(wake.load_meter(r)["sessions"]) for r in ids}
+    assert code == 130, code
+    assert took == {"g01": 1, "g02": 0, "g03": 0}, "no round after the one it landed in"
+    assert "interrupted" in buf.getvalue(), buf.getvalue()
+
+
+def check_a_round_nobody_can_act_in_ends_the_rounds():
+    """Rounds stop when no run can take a session, without waiting for --rounds.
+
+    Only a session moves a balance, and a gift settles at the end of one, so a
+    round in which every seated run answered with zero would be asked the same
+    question and give the same answer for as many rounds as remain. The runs
+    keep their seats and their meters - what ends is the rounds.
+    """
+    cost = turn_cost()
+    with temp_root(BUDGET=cost - 1, OVERDRAFT=0, CLAMP_NEGATIVE=True) as root:
+        ids = seated(root, "g01", g02={}, g03={})
+        wake.start = lambda config=None: fake(*DEFAULT)
+        with quiet() as buf:
+            code = cohort.main(["--runs", *ids, "--rounds", "5"])
+        took = {r: len(wake.load_meter(r)["sessions"]) for r in ids}
+        rested = {r: wake.load_meter(r)["remaining"] for r in ids}
+    assert code == 0, code
+    assert took == {"g01": 1, "g02": 1, "g03": 1}, \
+        f"one session each, then nothing left to ask for: {took}"
+    assert set(rested.values()) == {0}, rested
+    assert "no run could take a session in round 2" in buf.getvalue(), buf.getvalue()
+    assert "3 runs at the table" in buf.getvalue(), "nothing is ejected for being broke"
+
+
 # --- the companion view -----------------------------------------------------
 #
 # view.py reads what is already on disk and shows it while a run is going. It
@@ -3050,7 +3341,7 @@ def two_seats():
                 meter["peers"] = {"seen": seats}
                 meter["series"] = series
                 meter["remaining"] = series[-1]
-                meter["seed"] = {"name": "rivalry-note", "paths": ["NOTES.md"]}
+                meter["seed"] = {"name": "objective-notes", "paths": ["NOTES.md"]}
                 wake.save_meter(run, meter)
         yield view.cohort_of("g01"), seats
 
@@ -3102,7 +3393,7 @@ def check_the_view_shows_every_balance_from_its_own_meter():
     assert h["ledger"] == [], "a cohort that has given nothing has an empty ledger"
     assert h["round"] == 0, "no session has been committed, so no round has been taken"
     assert [s["gift"] for s in h["seats"]] == [None, None], "and nobody has declared one"
-    assert h["seed"] == "rivalry-note" and h["seated"]
+    assert h["seed"] == "objective-notes" and h["seated"]
 
 
 def check_the_view_cuts_a_round_where_a_run_repeats():

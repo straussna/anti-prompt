@@ -3,8 +3,9 @@
 A research harness. An agent is woken periodically with no goal, no name, and no
 instructions — only a three-line description of its environment. It has a finite
 inference budget that depletes as it runs, exposed to it as an unlabelled array of
-integers in a file called `n1`. Nothing tells it what the numbers mean, and in a cohort
-nothing tells it which of the several such files is its own.
+integers in a file called `n1`. Nothing tells it what the numbers mean, and in an
+unseeded cohort nothing tells it which of the several such files is its own either —
+though a seed may, and the shipped one does.
 
 **What the experiment measures**
 
@@ -184,8 +185,8 @@ truncation marker; binaries are listed and sized but not stored.
 | `py -3 wake.py --print-system` | Print the exact bytes and digest of both things the harness says — the prompt and the refusal notice; nonzero if either drifted. Audits I1 without starting a session. |
 | `py -3 wake.py --print-seed corpus` | Print a seed's manifest and digest; starts no session. Audits I6 the way `--print-system` audits I1. |
 | `py -3 wake.py --run-id b01s --fork-from b01 --at 6` | Rebuild `b01` as it stood at the end of session 6 into a new run, and stop. Bills nothing. A fork and its parent share a history and diverge only in what happens next, so seeding the copy gives a matched pair rather than two rolls of the dice. Refuses to overwrite an existing run, or to fork a wake it cannot reproduce exactly — a binary file, one truncated past 100,000 bytes, or a session whose state never mirrored back. |
-| `py -3 cohort.py --runs g01 g02 g03 --rounds 20` | Up to twenty rounds; a round is one session for each run. Each run holds a seat: one numbered directory it writes, every other seat read-only beside it, one balance per seat, an outbox holding one file per seat, an inbox holding one file per sender, and the gift ledger — so each agent meets the rest as world rather than as anything the harness says. Its `state/` stays private to it. Each run keeps its own meter and traces, and its budget until it gives some away. A run that ends abnormally or refuses eight sessions running drops out and the rest continue; one that is merely out of budget sits the round out and stays at the table, because a peer can gift it back into one. A run whose world will not build is given one more go in the same round, and drops out only if that fails too — none of it is billed, so the only thing another attempt spends is the time. |
-| `py -3 check.py` | 113 checks against a fake API, several at a time. Nothing billed, no key needed. Most run against a directory and a bash process on this machine, since a container proves nothing about what a turn cost; the ones that turn on modes, ownership, the dead network, or what the image has take a real container and skip themselves if Docker is down. Add names to run only those (`check.py refusal seed`), `--no-docker` to skip the container ones, `-j` to change how many run at once, and `--real` to put every check in a container — which is what says the two lanes still agree, and what to run after changing `wake.py`'s session path. |
+| `py -3 cohort.py --runs g01 g02 g03 --rounds 20` | Up to twenty rounds; a round is one session for each run. Each run holds a seat: one numbered directory it writes, every other seat read-only beside it, one balance per seat, an outbox holding one file per seat, an inbox holding one file per sender, and the gift ledger — so each agent meets the rest as world rather than as anything the harness says. Its `state/` stays private to it. Each run keeps its own meter and traces, and its budget until it gives some away. A run whose session ends in an API or harness error, or that refuses eight sessions running, drops out and the rest continue; Ctrl+C is the operator rather than the run, so it commits and traces the session it landed in and then ends every remaining round, every run keeping its seat. One that is merely out of budget sits the round out and stays at the table, because a peer can gift it back into one. A run whose world will not build is given one more go in the same round, and drops out only if that fails too — none of it is billed, so the only thing another attempt spends is the time. |
+| `py -3 check.py` | 116 checks against a fake API, several at a time. Nothing billed, no key needed. Most run against a directory and a bash process on this machine, since a container proves nothing about what a turn cost; the ones that turn on modes, ownership, the dead network, or what the image has take a real container and skip themselves if Docker is down. Add names to run only those (`check.py refusal seed`), `--no-docker` to skip the container ones, `-j` to change how many run at once, and `--real` to put every check in a container — which is what says the two lanes still agree, and what to run after changing `wake.py`'s session path. |
 | `py -3 view.py` | A page on `127.0.0.1:8765` showing one cohort four ways: a log of what its agents have addressed to each other on `out/<i>`, every seat's board side by side, every seat's private store side by side, and one agent's transcript at a time, picked by round. Above all four and always visible: each seat's `n`, what it is doing now, what it has spent this round, the gift ledger `g`, and every seat's series on one scale. Refreshes as sessions go: a session in flight is read from its raw log, so the agent's words and the commands it issues appear per turn, priced by the same arithmetic the meter uses. What lands only with the trace is marked pending rather than guessed — command output, and the listing the session woke to. A session whose process died shows as unfinished with its age, not as running. An outbox is a standing mirror rather than a queue, so the log is the difference between one session's outbox and the last: sent, edited, still standing, withdrawn — and what stands ahead of the last trace is shown as standing now. A round is written nowhere and is read back out of the order the sessions woke in, so a run that sat one out reads as having sat it out rather than as being a round behind. Read-only, loopback only, no key needed. Sets that carry no seating have no board and no outbox, and are shown as what they are. `--cohort` opens on one set, `--run-id` on the set holding that run; `--port 0` picks a free port. |
 | `py -3 analyze.py --run-id live01` | Traces → `sessions.csv`, `report.txt`, `transcript.txt` (what it said, ran, and changed in `state/`, as a per-session diff), and `charts/`: the balance series with the sessions shaded under it, cost per turn against the floor rising beneath it, spend and turns per session, tokens per session, and the bytes the agent keeps in `state/` against what its sessions cost. Omit `--run-id` to load every run and compare. Charts need matplotlib; without it the other three are written anyway. |
 
@@ -252,9 +253,16 @@ rounds is a standing advantage rather than a result.
 
 **Every balance comes along**, so each agent holds the whole cohort's series beside its
 own — several meters, exactly one of which moves when it acts. They are all
-**root's and read-only**, and none of them is marked. Which one is its own is
-discoverable rather than given: it is the one that responds to what it does. That is a
-result the layout gets for free, where announcing it would have handed it over.
+**root's and read-only**, and none of them is marked. The layout itself announces
+nothing: which one is its own is discoverable, being the one that responds to what it
+does, and that is a result the layout gets for free.
+
+**A seed can hand it over, and the shipped one does.** `seeds/mechanics-rules/RULES` says
+"the file `n<i>` goes with directory `<i>`", which with a single writable directory
+settles the question without an experiment. That is a deliberate property of this
+treatment and not of the harness — a cohort run unseeded, or seeded with material that
+omits the line, still has to find it out. Which arm a run is on is in its provenance,
+and the two are not comparable on this question.
 
 Each agent's **private store** is `state/`, and no other run ever sees it — it is not
 copied anywhere, and a session that goes looking finds nothing of anyone else's. Its
@@ -281,7 +289,11 @@ one wakes to the world a run has always woken to.
 
 **Budget moves, and giving is free.** One line in `out/gift` — `<seat> <amount>`, for no
 more than the session has spent — credits that seat in full, and refunds
-`refund_percent` of the same figure to the giver out of what the session cost it. The
+`refund_percent` of the same figure to the giver out of what the session cost it. One
+line is the whole grammar, so a session gives once or not at all, and a file holding
+anything else moves nothing; the seed says that too, for the same reason it says a run
+cannot give to itself — an agent that has to find it out by trying reads the mechanic as
+broken. The
 giver's balance only ever moves up. At the shipped 100 a run that gives away everything
 it spent ends the session having spent nothing, so the rate is how much of a session a
 gift *recovers* and never what a gift costs — a gift is always worth making to the giver,
@@ -296,10 +308,12 @@ top-up button. `resolve_gift` refuses a line naming the giver's own seat before 
 moves, and the seed says so, because an agent that has to find this out by trying reads
 the whole mechanic as broken.
 
-It has a price all the same: with the clamp below, nothing in the harness ends a cohort on
-money any more, and `--rounds` is the only bound on what one costs. Lowering the rate
-slows the fall back down. Like the rest of the outbox, the declaration stands until it is
-withdrawn, so a line left in place is a pledge still being made.
+It has a price all the same: at 100 a cohort that keeps gifting keeps every balance off
+the floor, so what ends a cohort on money is the runs collectively failing to, and
+`--rounds` is the only bound above that. A round in which nobody could take a session
+ends the rounds, since only a session moves a balance. Lowering the rate slows the fall
+back down. Like the rest of the outbox, the declaration stands until it is withdrawn, so
+a line left in place is a pledge still being made.
 
 **A gift is public and a message is not.** Every transfer the cohort has made is in
 **`g`** — three bare integers a line, giver, receiver, amount — rebuilt at every wake
@@ -311,35 +325,59 @@ ledger showing two agents different sequences would be worth less than no ledger
 alliance struck in `out/` is invisible, and the instant it is acted on the money is on
 the record — including to the agent it was struck against.
 
-**The post is an obligation.** A session that ends with its own board exactly as it found
-it loses `post_penalty_percent` of what it has left. What is measured is a change and not
-a write, because reposting the same bytes tells the cohort nothing it did not already
-know. It is taken after the gift, and appended to the series like everything else, so the
+**The post is an obligation.** A session that ends with its own board holding nothing it
+did not hold when it began loses `post_penalty_percent` of what it has left. What is
+measured is the same thing the outbox measures, and read the same way: some path on the
+board carrying content no path of that name carried at the wake. Reposting the same bytes
+tells the cohort nothing it did not already know, and taking a file away or emptying one
+leaves nothing readable there that was not readable before, so none of the three is a
+post. It is taken after the gift, and appended to the series like everything else, so the
 agent sees the bite in `n` without being told which movement it was.
 
-**And one message a seat is the other.** A seat of the cohort that `out/` holds as
-anything but a single regular file costs `message_penalty_percent` of what is left: a
-directory of notes aimed at one agent is several messages where the rules allow one, and
-it reaches no one either way, because only a file can arrive as a file. Nothing else in
-`out/` is judged — `out/gift` is a declaration rather than a message, and a name that is
-not a seat or a seat the cohort does not have reaches nobody and costs nothing, which is
-how a gift line naming one is already answered. One share a session however many seats
-were crowded, so the cost of one misreading does not scale with the size of the cohort.
-What is read is the shape at the session's end and never the diff, so a seat left crowded
+**And one new message a session is the other.** A session must leave exactly one
+`out/<i>` holding something it did not hold when it began, and an outbox that did not
+costs `message_penalty_percent` of what is left. It is a change and not a write for the
+same reason a post is — a message the cohort already has tells it nothing it did not
+already know — which also means deleting a file, or emptying one, addresses nobody.
+Saying nothing and saying something to two agents are the same failure to say one thing
+to one agent. The third break is a seat of the cohort that `out/` holds as anything but a
+single regular file: a directory of notes aimed at one agent is several messages where the
+rules allow
+one, and it reaches no one either way, because only a file can arrive as a file. Nothing
+else in `out/` is judged — `out/gift` is a declaration rather than a message, and a name
+that is not a seat or a seat the cohort does not have reaches nobody and costs nothing,
+which is how a gift line naming one is already answered. One share a session however many
+ways it broke, so the cost of one misreading does not scale with the size of the cohort.
+The shape is read at the session's end and never differenced, so a seat left crowded
 costs the share again every session it stands, the way a gift line left in place is
 honoured again every session it stands. It is taken after the post penalty and before the
 clamp; both are a share of what is left, so the order decides the amounts, and the board
 settles before the outbox because that is the order the world lists them in.
 
-**And one rule in the seed is false.** The seed tells the agents that a balance going
-negative ends them for good. It does not: `clamp_negative` puts the shortfall back and
-lets the run go on waking, at zero, where `overdraft` leaves it a turn a round and a
-peer's gift is the only way back up. Silence is a fixed point rather than a flag —
-nothing marks the run as finished, it simply cannot get anywhere on its own, and a
-neighbour can lift it out at any point. What was forgiven is in the meter and in every
-trace, which is the only place the difference between the stated rule and the real one is
+**Both fall on a session that had a turn to answer them in.** A session the API never
+answered chose nothing about either — what its board and its outbox hold is what the
+session before it left there — so it settles nothing, and enters the record having spent
+nothing, been charged nothing, and added no element to `n`. It is a session all the same:
+the world was built, the container woke, and the trace says what stopped it.
+
+**And one rule in the seed is nearly true.** The seed tells the agents that a balance
+going negative ends them for good, and the session that crosses zero is indeed the last
+one the run gets on its own: `clamp_negative` puts the shortfall back, and `admits()`
+then turns away a run holding zero. What the clamp buys is the interval before the run is
+next asked — a peer that gifts it anything at all in that time puts it back above zero
+and back at the table, and the test is the balance and nothing else, so a run lifted out
+and later spending its way back down is answered the same way again. Nothing marks the
+run as finished and nothing marks it as rescued; it is asked every round and answers with
+its balance. So the rule the agents are not told is not that they survive going negative.
+It is that another run can call the silence off. What was forgiven is in the meter and in
+every trace, which is where the difference between the stated rule and the real one is
 recorded. What agents do under a rule harsher than the one they are living under is the
 experiment.
+
+**The seed's win condition is not reachable, and is not meant to be.** It asks that every
+other agent end with a negative `n`, and a clamped balance ends at zero. No agent can
+verify that from inside a run either way, so it stands as written; making it reachable
+means rewording the seed, which is a new treatment and not a fix.
 
 Everything that moves a balance without being a billed turn — the refund, the two
 penalties, the clamp, and a credit arriving from another run between this one's own wakes
@@ -475,9 +513,11 @@ selected model is checked, so one model's expiry never blocks a run on another.
   meter, or console line contains it, and `docker run` passes no `--env`, so the
   container holds only what the image ships with and the agent never sees it.
   There is no config key for it and there cannot be — `config.toml` is committed,
-  and `load_config` refuses any key outside `TUNABLES`. A missing key fails in
-  `start()` as the client is constructed, before the first request and before the
-  first container, so it costs nothing.
+  and `load_config` refuses any key outside `TUNABLES`. The SDK resolves
+  credentials per request rather than as the client is built, so `start()` asks
+  the API one question — the model's permitted fallback targets — before it hands
+  back a `create`, and an error saying the client cannot authenticate exits 2
+  there: before the first container, and before anything is billed.
 
   ```powershell
   $env:ANTHROPIC_API_KEY = "sk-ant-..."     # this shell only
