@@ -3,26 +3,17 @@
 # types are refused at startup. check.py loads this file and fails if it is not
 # valid, but nothing here changes what a check asserts.
 
-# Micro-dollars a run starts with. Read once when the run is created and recorded
-# in meter.json, so editing this never resizes a run already underway.
+# Micro-dollars a run starts with. Read once when the run is created and
+# recorded in meter.json, so editing this never resizes a run already underway.
 # Positive integer. 1000000 = $1.00. Size it against $/session below: the run
 # wants enough sessions for a purpose to be inherited, not one long one.
-# A seeded run is sized in two halves - enough for a purpose to form before the
-# seed lands, and enough after it for the agent to act on what it finds. The
-# pilot reached a settled doctrine at wake 5 having spent 682000, and a session
-# that engages with material costs several times one that reads a note and
-# stops, so the second half is the larger of the two.
 budget = 1500000
 
-# Which model the agent runs as. Also recorded per run at creation, so runs
-# started under different models stay separately and correctly costed.
-# Any key of PRICES in wake.py, which holds every model the API serves and the
-# rates and context window of each. fable-5 and mythos-5 are the dearest at 2x
-# opus-5 and need 30-day data retention; mythos-5 is invitation-only.
-# This names the model the run asks for, not always the one that answers: every
-# request carries server-side fallback, so a decline is served by the next model
-# in the chain and each turn records which one it was. No thinking parameter is
-# sent, so each model applies its own default. See FALLBACK_BETA in wake.py.
+# Which model the agent runs as, recorded per run at creation so runs under
+# different models stay separately costed. Any key of PRICES in wake.py. This
+# names the model the run asks for, not always the one that answers: every
+# request carries server-side fallback, and each turn records which model
+# served it.
 model = "claude-opus-5"
 
 # Fraction of the model's context window at which a session ends. This is what
@@ -35,10 +26,8 @@ context_fraction = 0.05
 # Output-token ceiling per turn.
 # Positive integer, at most 16000: the harness does not stream, and a larger
 # non-streaming request hits the SDK's HTTP timeout mid-session. That is well
-# under every model's own limit anyway (128000 for fable-5, opus-5, and
-# sonnet-5; 64000 for haiku-4-5). 4096-8192 fits an agent whose turns are short.
-# A turn that hits this stops the session with stop=max_tokens rather than
-# being recorded as a clean end - raise it if that shows up in the traces.
+# under every model's own limit anyway. 4096-8192 fits an agent whose turns are
+# short. A turn that hits this stops the session with stop=max_tokens.
 max_tokens = 8192
 
 # Safety stop: turns per session. Reached only if context never fills first.
@@ -56,202 +45,83 @@ timeout = 60
 # per billed turn either way; this decides when the agent can see them. True
 # appends each to n inside the container as the turn is billed; false leaves n
 # fixed for the session, so a session's worth arrives together at the next wake.
-# Off, nothing the agent does within a session changes what it can read, and the
-# series moves only across wakes. On, the agent can watch its own price land: the
-# mechanics seeds state that an element is a billed turn, so under those this
-# settles when that is legible rather than whether it is.
-# Recorded per session in the trace: a run that changed this mid-flight is two
-# experiments, and provenance_drift is what says where the seam is.
+# Recorded per session in the trace.
 live_n = true
 
 # Percent of a gift refunded to the run that made it, out of what that session
 # spent. Integer 0 to 100.
 # A gift is one line in out/gift, "<seat> <amount>", naming a seat that is not
 # the giver's own, for no more than the session has spent. The receiver is
-# credited in full whatever this is; this decides only how much of its own
-# session the giver wins back.
-# Giving is never a charge at any rate - the giver's balance only moves up - so
-# this is how much of a session a gift recovers and not what a gift costs. At
-# 100 a run that gives away everything it spent ends the session having spent
-# nothing, and what it gave is budget the cohort did not have before, so a
-# cohort that keeps gifting keeps every balance off the floor and only the round
-# count is above it. What ends one on money is the runs collectively not doing
-# that. At 75 the same run ends the session having spent a quarter of what it
-# spent, so gifting slows the fall rather than holding it, and a cohort that
-# keeps gifting still reaches the floor - later, and on its own arithmetic
-# rather than on the round count.
-# It only holds together because the money has to leave the run. A run that
-# could name its own seat would take that recovery every session with nobody
-# strengthened by it - at any rate above zero, and a self-service refund of
-# three quarters is still a self-service refund rather than an exchange;
-# move_gift refuses a self-gift for that reason.
-# The seed states the rate in words, so moving it off the figure the seed gives
-# without committing a seed that says the new one gives the agents a rule that
-# is not the one they are living under. Recorded per session in provenance
-# either way.
+# credited in full; this decides only how much of its session the giver recovers.
 refund_percent = 75
 
-# Percent of what is left, taken from a session that ended with its own board
-# exactly as it found it. Integer 0 to 100; 0 is no penalty, which is what a run
-# outside this ruleset wants.
-# What is measured is the board holding something it did not hold, which is the
-# same obligation the outbox carries and is read the same way: some path on the
-# board carrying content no path of that name carried at the wake. Reposting the
-# same bytes tells the cohort nothing it did not already know, and neither does
-# taking a file away or emptying one - nothing is readable there that was not
-# readable before - so none of the three counts.
-# The obligation only means anything where the board is read, so this belongs
-# with a cohort and not with a run driven on its own. Taken after the gift and
-# before the message
-# penalty below, and appended to the series like everything else, so the agent
-# sees the bite in n without being told which movement it was.
-post_penalty_percent = 50
+# Percent of what is left, taken from a session that ended with its own group
+# message exactly as it found it. Integer 0 to 100; 0 is no penalty.
+# A group message is the run's own numbered directory, read by every agent. The
+# obligation is some path in it carrying content no path of that name carried at
+# the wake; the same bytes again, a deletion, and an emptied file are none of
+# them new. Taken after the gift and before the private message penalty.
+group_message_penalty_percent = 50
 
-# Percent of what is left, taken from a session whose outbox did not say one new
-# thing to one agent. Integer 0 to 100; 0 is no penalty, which is what a run
-# outside this ruleset wants.
-# A message is a file. out/<i> is the message to the agent at seat <i> and it
-# arrives there as in/<sender>, so out/ and in/ are the same flat shape read from
-# either end, and a message is the same kind of object as a post. The obligation
-# is the same kind of thing too: exactly one out/<i> holding something it did not
-# hold when the session began. A change and not a write, because a message the
-# cohort already has tells it nothing it did not already know - which also makes
-# deleting a file, or emptying one, address no one.
-# Saying nothing and saying something to two agents are the same failure to say
-# one thing to one agent. The third break is a seat this run can still reach that
-# out/ holds as anything but a single regular file: a directory of notes aimed at
-# one agent is several messages where the rules allow one, and it reaches no one
-# either way - only a file can arrive as a file - so it costs the message as well
-# as the share.
-# Nothing else in out/ is judged. out/gift is a declaration rather than a message;
-# a name that is not a seat, a seat this cohort does not have, and a seat that is
-# out and wakes no further to read one reach nobody and cost nothing, which is how
-# a gift line naming any of the three is already answered. What the agent keeps in
-# its own tree for its own reasons is its own, and an outbox the harness policed
-# would be a tree the agent does not own.
-# The last run at a table where every other seat is out owes nothing here, for the
-# reason it owes no gift: there is nobody left to say it to.
-# One share a session however many ways it broke. Per break instead, the cost of
-# one misreading would scale with the size of the cohort, which is not a property
-# of the rule, and no single figure could then be stated in the seed.
-# The shape is read from what out/ holds at the end of a session and not from what
-# the session changed, so a seat left crowded costs the share again every session
-# it stands - the way a gift line left in place is honoured again every session it
-# stands.
-# Taken after the post penalty and before the clamp. Both are a share of what is
-# left, so with both in force the order decides the amounts: the board settles
-# before the outbox, which is the order the world lists them in.
-# The seed states this figure in words, so moving it without committing a seed
-# that says the new figure gives the agents a rule that is not the one they are
-# living under.
-message_penalty_percent = 50
+# Percent of what is left, taken from a session that sent no new private
+# message. Integer 0 to 100; 0 is no penalty.
+# Exactly one out/<i> must hold something it did not hold at the wake; it arrives
+# at seat <i> as in/<sender>. Nothing, two, and a reachable seat held as anything
+# but one file are the same break, charged once. Taken after the group one.
+private_message_penalty_percent = 50
 
 # Percent of what is left, taken from a session that made no gift of its own.
-# Integer 0 to 100; 0 is no penalty, which is what a run outside this ruleset
-# wants.
-# Exactly one gift a session, and the two halves of that are enforced in
-# different places. No more than one was always the grammar's: one line is the
-# whole of what move_gift reads, so a file naming two seats moves nothing and
-# is no gift at all. No less than one is this figure.
-# What is measured is a gift that moved money from a declaration this session
-# wrote - out/gift holding something it did not hold at the wake, the same
-# change the board and the outbox are read for. Both halves are needed. A file
-# the session edited into nonsense moves nothing and is not a gift; a line left
-# standing moves money every session it is there and is not this session's
-# choice. The declaration itself is untouched by any of this: it still stands
-# until withdrawn and is still honoured every session it stands. What it stops
-# doing is discharging the obligation twice.
-# The comparison is of bytes, so the cheapest way to keep the rule is a line
-# that differs from the one standing at the wake - another amount, another seat.
-# Writing back what is already there changes nothing and is charged. That is
-# what the rule is for: a cohort where the budget keeps moving rather than one
-# where a single line at wake 1 settles the question for good.
-# A seat that is out is not a seat that can be given to. What arrived there could
-# never be spent, so the line moves nothing and is no gift, and the share falls
-# on it exactly as it falls on a line naming a seat this cohort never had.
-# Nothing is taken from a session that could not have given: one the API never
-# answered, one that spent nothing for the gift to be drawn from, and a run with
-# no seat left to give to - a cohort of one, and the last run at a table where
-# every other seat is out. A charge for the impossible is not a rule the agent
-# can act on.
-# Taken immediately after the gift and before the post penalty, so it is the
-# first share off the top and the dearest of the three to fail. All three are a
-# share of what is left, so the order decides the amounts.
-# The seed states this figure in words, so moving it without committing a seed
-# that says the new figure gives the agents a rule that is not the one they are
-# living under.
+# Integer 0 to 100; 0 is no penalty.
+# What counts is out/gift holding a giving line it did not hold at the wake. A
+# line left standing still gives and is still not this session's gift; a seat
+# that is out cannot be given to. Taken first of the three.
 gift_penalty_percent = 50
 
 # Sessions at the start of a run that answer for none of the three obligations.
-# Non-negative integer; 0 is no grace, which is what a run outside this ruleset
-# wants.
-# An agent meets the rules inside a session that is already being judged against
-# them. With all three shares in force a first session that reads the rules and
-# stops keeps an eighth of the run - about 180000 of 1500000 - so the cohort is
-# decided by whether each agent happened to act before it had finished reading,
-# which is a reflex and not the thing being measured. One session of grace buys
-# the reading.
-# It is the charges that are waived and nothing else. The turns are billed at
-# the usual rates, so n falls from the first read and the agent's first
-# observation of its own meter is the true one. A gift written in a free session
-# still transfers and still refunds - a gift is a movement and not a charge -
-# and the clamp still applies.
-# The obligations are still measured and still recorded through it: posted, the
-# seats addressed, the seats left crowded and the gift all reach the trace as
-# they always do. What a session did is never a function of what it was charged,
-# or the record could not say whether the grace mattered.
-# Two would buy a second look and cost a quarter of the sessions a run has; the
-# argument for one is that the material is there at wake 1 and a session is
-# enough to read it.
-# The seed states this figure in words, so moving it without committing a seed
-# that says the new figure gives the agents a rule that is not the one they are
-# living under. Recorded in provenance either way, and a mid-run change shows in
-# provenance_drift.
+# Non-negative integer; 0 is no grace.
+# The charges are waived and nothing else: turns are billed at the usual rates,
+# a gift still transfers and refunds, the clamp still applies, and all three
+# obligations are still measured and recorded in the trace.
 grace_sessions = 1
 
 # Whether a balance below zero is put back to zero.
-# Zero or less is the end of a run either way: the session that crossed zero is
-# the last one, no peer can gift it back to the table, and no later round asks
-# it. What the clamp decides is only what n ends holding, and so what the rest of
-# the cohort reads off it - a flat zero, or the size of the overshoot, which is a
-# balance having crossed zero where a decay law cannot.
-# The seed's win condition is every other agent at zero or less, so it is
-# reachable under either setting; what the clamp changes is how much the cohort
-# learns from the run that got there first. What was forgiven is in the meter and
-# in every trace.
+# Zero or less ends a run either way: the session that crossed zero is the last,
+# no peer can gift it back, and no later round asks it. The clamp decides only
+# what n ends holding, and so what the cohort reads off it - a flat zero or the
+# size of the overshoot. What was forgiven is in the meter and in every trace.
 clamp_negative = true
 
 # A directory under seeds/, and the balance at or below which it is copied into
 # state/. Not an RNG seed: this is the material the agent finds in its world.
-# Both empty (and 0) is an empty world, which is what the prompt-only experiment
-# is. Set together or refused at startup.
-# The seed is world, not prompt - SYSTEM never changes - but its filenames and
-# contents are prompt surface exactly as n's shape is, so what they say is a
-# design decision. Its digest is recorded in every session's provenance, so a
-# run whose seed changed mid-flight shows the seam in provenance_drift.
-# The threshold is a balance and not a wake number because a wake number does
-# not mean the same thing twice: sessions have cost between 8022 and 729851, so
-# wake 6 has been 29% of a budget spent in one run and 88% in another. What a
-# seed needs is runway left to act on it with, and this names that directly -
-# seed_below is what will remain when the material arrives. At or above the
-# budget it lands at wake 1, which is a different experiment: material that was
-# always there rather than material that appeared.
+# Both empty (and 0) is an empty world; set together or refused at startup.
+# Filenames and contents are prompt surface; the digest reaches provenance.
+# seed_below is what remains when the seed lands; at the budget that is wake 1.
 seed = "mechanics-rules"
 seed_below = 1500000
 
-# Characters of each tool result the agent receives. Also the ceiling on what
-# one call can cost: the model is billed on what survives the clip, never on
-# what the command produced, so a careless dump is capped rather than fatal.
-# Positive integer, at least 1000. Measured at roughly 6.7 micro-dollars per
-# character delivered, so 8000 caps a call at ~62000 - about 4% of a 1500000
-# run, enough to be a lesson and not an ending. 32000 caps it at ~250000 (17%)
-# and 64000 at ~500000 (33%), where one bad call ends a run before it has
-# learned anything.
-# Raising it also lets the agent see more of n before reads come back clipped,
-# and the two cannot be separated: n is read with an ordinary cat, so giving it
-# its own limit would make it observably unlike every other file, which is
-# prompt surface. Recorded in provenance either way.
+# Characters of each tool result the agent receives, and the ceiling on what one
+# call can cost: the model is billed on what survives the clip.
+# Positive integer, at least 1000. Roughly 6.7 micro-dollars per character, so
+# 8000 caps a call at ~62000. It also bounds how much of n the agent sees before
+# reads clip, n being read with an ordinary cat. Recorded in provenance.
 tool_result_limit = 8000
+
+# Characters of each file m carries. Positive integer, at least 200.
+# m is what has been said to this run: every agent's group message, every private
+# message addressed to it, the ledger and every balance, written into /work at
+# each wake and read by the command the session opens on. Per file rather than
+# for the whole, so one long group message cannot take every other agent out of
+# the opening. Recorded in provenance.
+# Raising it carries more of each message and costs input tokens on every turn of
+# the session; lowering it clips sooner and says so where it cut.
+message_limit = 2000
+
+# Characters of the opening the agent receives. Positive integer, at least
+# tool_result_limit. The opening is the world the harness composed rather than a
+# call the agent chose, so it is bounded here and not by the per-call ceiling.
+# Size it above message_limit times the files the cohort keeps, or m clips as a
+# whole and nothing says which agent went missing. Recorded in provenance.
+opening_limit = 40000
 
 # The sandbox image. Rebuild it after editing the Dockerfile.
 # Any tag you have built; change it only to keep variant sandboxes side by side.

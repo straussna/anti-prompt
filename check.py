@@ -1,21 +1,8 @@
 """Verification. No API spend.
 
-    py -3 check.py                  every check, several at a time
-    py -3 check.py refusal seed     only the ones named so
-    py -3 check.py --real           every check in a real container
-    py -3 check.py --no-docker      only the ones that need no container
-    py -3 check.py -j 1 --list
+    py -3 check.py [names...] [--real | --no-docker] [--list] [-j N]
 
-A fake `create` is injected into wake.run_once, so the whole pipeline runs -
-meter, turns, series, trace - with nothing billed.
-
-Sessions run in one of two places. Most checks are about arithmetic, and a
-container proves none of it, so they run against a directory and a bash process
-on this machine. What only a container can show - modes, ownership, the dead
-network, what the image has - takes a real one, and those are the checks that
-skip when Docker is down. `--real` puts every check in a container, which is
-what says the two still agree.
-"""
+A fake `create` goes into wake.run_once, so the pipeline runs unbilled."""
 
 from __future__ import annotations
 
@@ -63,9 +50,8 @@ def usage(**kw):
 def attempt(model, output_tokens, kind="message", **kw):
     """One entry of usage.iterations: what a single model's attempt cost.
 
-    The declining attempts of a fallback chain are `message`; the last one, by
-    whichever model the chain reached, is `fallback_message`. An attempt that
-    produced no output declined before producing any.
+    The declining attempts of a chain are `message`; the last is
+    `fallback_message`. An attempt with no output declined before producing any.
     """
     return NS(**{"type": kind, "model": model, "input_tokens": 100, "output_tokens": output_tokens,
                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
@@ -75,9 +61,8 @@ def attempt(model, output_tokens, kind="message", **kw):
 def say(text="done.", u=None, id=None, stop="end_turn", details=None, model=None):
     """A scripted step: reply with text and stop.
 
-    `details` stands in for the API's stop_details, which it sends only
-    alongside a refusal. `model` overrides the model the response reports having
-    come from, which is how a fallback-served turn is scripted.
+    `details` stands in for stop_details, sent only alongside a refusal.
+    `model` overrides what the response reports, scripting a fallback-served turn.
     """
     return {"kind": "say", "text": text, "u": u, "id": id, "stop": stop, "details": details,
             "model": model}
@@ -96,8 +81,7 @@ def refuse(*cmds, category="cyber", u=None, id=None, **detail):
     """A scripted refusal, in either shape the API sends one.
 
     With commands it carries the tool calls emitted before the block landed;
-    with none its content is empty, as a refusal arriving before any output.
-    `detail` adds fields to stop_details, such as a recommended_model.
+    with none its content is empty. `detail` adds fields to stop_details.
     """
     return run(*cmds, u=u, id=id, stop="refusal",
                details=NS(type="refusal", category=category, explanation="declined", **detail))
@@ -195,22 +179,16 @@ def _ask_docker() -> bool:
 
 # --- the host box -----------------------------------------------------------
 #
-# Most checks here are about arithmetic: what a turn cost, what reached the
-# series, which stop a session ended on. A container proves none of that, and at
-# three to four seconds each they were most of the suite's wall clock. Those run
-# against a directory and a bash process on this machine instead.
-#
-# What only a container can show - modes, ownership, the dead network, what the
-# image does and does not have - stays on docker_root below.
+# Arithmetic checks - what a turn cost, what reached the series, which stop a
+# session ended on - run against a directory and a bash process on this machine.
+# What only a container can show stays on docker_root below.
 
 
 def host_bash() -> str | None:
     """The bash to run the host box's sessions in, as an absolute path.
 
-    Resolved rather than left to PATH: on Windows `bash` finds one thing and
-    subprocess finds another - Git's and WSL's, which disagree about what a path
-    is and what /tmp means - so the one being used has to be the one that was
-    looked at.
+    Resolved rather than left to PATH: on Windows `bash` and subprocess find
+    Git's and WSL's, which disagree about what a path is and what /tmp means.
     """
     return shutil.which("bash")
 
@@ -218,9 +196,8 @@ def host_bash() -> str | None:
 class HostShell(wake.Shell):
     """The session shell, as a bash process on this machine.
 
-    Inherits the sentinel framing, the timeout, and the output ceiling from
-    wake.Shell; only where the process runs and how a balance is rewritten
-    differ.
+    Inherits the sentinel framing, timeout, and output ceiling from wake.Shell;
+    only where the process runs and how a balance is rewritten differ.
     """
 
     def __init__(self, box: "HostBox") -> None:
@@ -249,11 +226,8 @@ class HostShell(wake.Shell):
 class HostBox:
     """A session's world as a directory on this machine, in place of a container.
 
-    Same five methods run_once asks of wake.Container, and the same five regions
-    in the same places - state/, the numbered boards, the outbox, the inboxes one
-    file each, and the balances and gift ledger beside them - so a check about
-    what reached the session reads the same in either lane. There is no ownership
-    and no locking here: a check that turns on either belongs on docker_root.
+    Same five methods run_once asks of wake.Container, same five regions. No
+    ownership and no locking: a check turning on either belongs on docker_root.
     """
 
     def __init__(self, name: str) -> None:
@@ -278,7 +252,7 @@ class HostBox:
                 if src.is_file():
                     shutil.copyfile(src, dest)
                 continue
-            if region == "board":
+            if region == "group":
                 self.index = name
             dest.mkdir(exist_ok=True, parents=True)
             if src.is_dir():
@@ -321,10 +295,8 @@ RESTORED = wake.TUNABLES | {"ROOT", "WATCH", "REFUSAL_TURNS", "BOX", "drive", "s
 def pinned():
     """Restore every wake global a check may move, on exit.
 
-    catch_signals is stubbed for the duration rather than merely restored: the
-    checks drive wake.main and cohort.main in this process, and a handler one of
-    them installed would outlive it and answer the suite's own Ctrl+C. The check
-    that is about catch_signals calls it outside a root.
+    catch_signals is stubbed rather than restored: a handler installed by a
+    check driving wake.main would outlive it and answer the suite's own Ctrl+C.
     """
     saved = {k: getattr(wake, k) for k in RESTORED}
     wake.catch_signals = lambda: None
@@ -357,13 +329,8 @@ def rooted(box, **overrides):
 def host_root(**overrides):
     """A throwaway run pinned to this machine, whatever --real says.
 
-    For the few checks about what is *sent* rather than about the session it
-    drives. A request is built before the box exists and is the same object in
-    either lane, so promoting one of these buys a container and no coverage.
-
-    Everything else wants temp_root, which --real does promote: that promotion
-    is the whole of what says the two lanes agree, so reach for this only when
-    the thing asserted is upstream of the box.
+    For the few checks about what is *sent* rather than the session it drives.
+    Everything else wants temp_root, which --real does promote.
     """
     if not host_bash():
         raise Skip
@@ -473,6 +440,8 @@ def check_config_is_validated():
         assert 0 < wake.CONTEXT_FRACTION <= 1
         assert wake.MAX_TOKENS <= wake.MAX_TOKENS_CEILING
         assert type(wake.LIVE_N) is bool
+        assert wake.MESSAGE_LIMIT >= wake.MESSAGE_FLOOR
+        assert wake.OPENING_LIMIT >= wake.TOOL_RESULT_LIMIT
 
     with tempfile.TemporaryDirectory(prefix="mtr-cfg-") as tmp:
         f = Path(tmp) / "config.toml"
@@ -480,7 +449,12 @@ def check_config_is_validated():
                     'model = "no-such-model"', 'context_fraction = 2.0', 'budget = 0',
                     'refund_percent = 101', 'live_n = "yes"',
                     # Above the ceiling the harness would time out mid-session.
-                    f'max_tokens = {wake.MAX_TOKENS_CEILING + 1}'):
+                    f'max_tokens = {wake.MAX_TOKENS_CEILING + 1}',
+                    # Below this a clipped message says less than its own marker.
+                    f'message_limit = {wake.MESSAGE_FLOOR - 1}',
+                    # The opening carries the whole record and is never smaller
+                    # than what one ordinary call may return.
+                    f'opening_limit = {wake.TOOL_RESULT_LIMIT - 1}'):
             f.write_text(bad, encoding="utf-8")
             with pinned():
                 try:
@@ -540,10 +514,8 @@ def check_lapsed_rates_are_refused():
 def check_unpriced_fallback_targets_are_refused_before_a_run_starts():
     """A permitted fallback target with no rates stops the run; anything else does not.
 
-    The list is what the requested model is allowed to fall back to, which is a
-    likely superset of what default routing will actually pick. Worth pricing
-    against before a run starts, and not the whole guard: a list that cannot be
-    read is not a reason to refuse a run that would otherwise be fine.
+    The list is a likely superset of what default routing will pick: worth
+    pricing against before a run starts, and not the whole guard.
     """
     def client(targets=None, raises=None):
         def retrieve(model, betas=None):
@@ -576,12 +548,8 @@ def check_unpriced_fallback_targets_are_refused_before_a_run_starts():
 def check_a_client_that_cannot_authenticate_refuses_the_run():
     """No usable credentials stops the run at start(), before any container.
 
-    Constructing the client resolves no credentials, so the run's first request
-    is where the question is answered - and the first request a run makes is
-    unpriced_targets' read of the model's fallback targets. Three shapes reach
-    it: the SDK's own auth errors, any error carrying 401 or 403, and, where
-    there is no key at all to send, a bare TypeError from the request builder
-    that carries no status and no class of its own.
+    Constructing the client resolves no credentials, so unpriced_targets' read
+    answers it. Three shapes: auth errors, 401/403, and a bare TypeError.
     """
     keyless = TypeError(
         '"Could not resolve authentication method. Expected one of api_key, '
@@ -617,10 +585,8 @@ def check_truncation_and_empty():
 def check_sessions_reconcile():
     """Every micro-dollar in or out of a meter is one element of its series.
 
-    Spend is not the only thing that moves a balance any more: a gift refunds,
-    a missed post and a crowded seat are each taken, and a clamp gives back. The
-    identity has a term for each, and every one of them appends where the agent
-    can read it.
+    A gift refunds, a missed post and a crowded seat are each taken, and a clamp
+    gives back. The identity has a term for each, and each appends to the series.
     """
     with temp_root():
         for _ in range(3):
@@ -645,7 +611,7 @@ def check_sessions_reconcile():
             "the last trace carries the series the meter committed"
 
     # And with every term live at once, the identity still closes.
-    with temp_root(REFUND_PERCENT=50, POST_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50,
+    with temp_root(REFUND_PERCENT=50, GROUP_MESSAGE_PENALTY_PERCENT=50, PRIVATE_MESSAGE_PENALTY_PERCENT=50,
                    GIFT_PENALTY_PERCENT=50, CLAMP_NEGATIVE=True) as root:
         seated(root, other={})
         wake_once(run("echo '2 300' > out/gift"), say())          # a gift, and no post
@@ -677,8 +643,7 @@ def check_a_gift_declaration_stands_until_it_is_withdrawn():
     """out/gift is a standing pledge: it is honoured at the end of every session.
 
     The outbox is a tree the harness never reaches into, so a line left in place
-    is a line still being said. An agent that means to give once has to take it
-    back, and one that means to keep giving need only leave it.
+    is still being said. Giving once means taking it back afterwards.
     """
     with temp_root(REFUND_PERCENT=100) as root:
         seated(root, other={})
@@ -694,12 +659,8 @@ def check_a_gift_declaration_stands_until_it_is_withdrawn():
 def check_exactly_one_gift_a_session_is_enforced():
     """No more than one was the grammar's already; no less than one is the share.
 
-    What discharges the obligation is a gift of the session's own: money moved,
-    from a declaration this session wrote. Both halves are needed, and the two
-    failures they answer are different. A file edited into something that gives
-    nothing is not a gift however new it is. A line left standing gives again
-    every session it stands - the pledge is untouched by any of this - and is
-    still not a gift this session chose.
+    What discharges the obligation is money moved from a declaration this
+    session wrote. A line left standing gives again and is not this session's.
     """
     with temp_root(GIFT_PENALTY_PERCENT=50, REFUND_PERCENT=100) as root:
         seated(root, other={})
@@ -754,13 +715,10 @@ def check_exactly_one_gift_a_session_is_enforced():
 def check_the_first_sessions_of_a_run_answer_for_nothing():
     """GRACE_SESSIONS: the opening sessions are charged none of the three.
 
-    An agent meets the rules inside a session already being judged against them,
-    and three compounding shares would settle the cohort on whether it acted
-    before it had finished reading. The grace buys the reading and nothing else:
-    the turns are billed at the usual rates, the obligations are still measured
-    and still recorded, and a gift written in a free session still moves.
+    The grace waives the charges and nothing else: turns are billed at the usual
+    rates, the obligations are still measured, and a free session's gift moves.
     """
-    with temp_root(POST_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50,
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50, PRIVATE_MESSAGE_PENALTY_PERCENT=50,
                    GIFT_PENALTY_PERCENT=50, GRACE_SESSIONS=1) as root:
         seated(root, other={})
         free = wake_once(run("echo notes > state/NOTES"), say())
@@ -798,12 +756,10 @@ def check_the_first_sessions_of_a_run_answer_for_nothing():
 def check_the_gift_share_is_taken_before_the_other_two():
     """Order decides the amounts, and the gift settles first of the three.
 
-    Each share is half of what is left at the moment it is taken, so a session
-    that fails all three keeps an eighth rather than losing three halves of the
-    same figure. The gift is charged on the spot, before the board and before
-    the outbox, which is what the seed states in words.
+    Each share is half of what is left when it is taken, so a session failing
+    all three keeps an eighth. Gift, then group, then outbox.
     """
-    with temp_root(POST_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50,
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50, PRIVATE_MESSAGE_PENALTY_PERCENT=50,
                    GIFT_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         t = wake_once(run("true"), say())
@@ -858,17 +814,16 @@ def check_live_n_can_be_turned_off():
 def check_live_n_leaves_n_read_only_and_alone():
     """The mid-session rewrite leaves the balance root's, read-only, and alone.
 
-    It is written as root from outside the agent's shell, so the mode the agent
-    sees must be the locked one either way. The stage file lives in /tmp, since
-    a second name beside the balance is a second thing the agent can read.
+    Written as root from outside the agent's shell, so the mode the agent sees
+    is the locked one either way. The stage file lives in /tmp.
     """
     with docker_root(LIVE_N=True):
         t = wake_once(run("stat -c '%a %U:%G %n' n1", "ls -a /work", "ls -a state"), say())
     stat, work, listing = (c["result"] for c in t["turns"][0]["tools"])
     assert stat.strip() == "444 root:root n1", stat
-    assert sorted(work.split()) == [".", "..", "1", "g", "n1", "state"], \
-        f"/work holds the balance, the ledger, the board, and state/, " \
-        f"and nothing else: {work}"
+    assert sorted(work.split()) == [".", "..", "1", "g", "m", "n1", "state"], \
+        f"/work holds the balance, the ledger, m, the group message, and " \
+        f"state/, and nothing else: {work}"
     assert sorted(listing.split()) == [".", ".."], f"state/ starts empty: {listing}"
     assert t["files"] == [], "and nothing the harness wrote is in a mirrored tree"
 
@@ -876,10 +831,8 @@ def check_live_n_leaves_n_read_only_and_alone():
 def check_a_negative_balance_is_what_the_run_ends_holding():
     """The overshoot is the last thing the meter writes, and no session wakes to it.
 
-    A balance can cross zero and a decay law cannot, so the sign flip is the run's
-    sharpest single datum. Every session stops at zero, overshooting only by the
-    turn in flight, and what the run ends holding is that overshoot - which no
-    instance ever reads, because zero or less is the end of the run.
+    Every session stops at zero, overshooting only by the turn in flight, and
+    what the run ends holding is that overshoot. No instance ever reads it.
     """
     # One short of a turn, so the first session cannot help but overshoot zero.
     cost = wake.measure(usage(), wake.MODEL)["centi"] // 100
@@ -984,8 +937,7 @@ def check_per_turn_micros_partition_the_spend():
     """The per-turn column sums to exactly what the session spent.
 
     A cache read prices at a tenth, so a single one puts half a micro-dollar on
-    each turn and the fraction has to carry - without it every turn is a round
-    number and this proves nothing.
+    each turn and the fraction has to carry.
     """
     odd = usage(cache_read_input_tokens=1)
     with temp_root(MODEL="claude-opus-5"):
@@ -1013,9 +965,8 @@ def check_interrupt_still_traces_and_commits():
 def stopping_at(turn: int, *steps):
     """A create that plays `steps` and raises STOPPING as it serves turn `turn`.
 
-    Stands in for a signal landing mid-call, which is the only moment that
-    matters: the flag is read at the top of the next turn, so what this scripts
-    is an interrupt the session has to finish a turn before it can answer.
+    Stands in for a signal landing mid-call: the flag is read at the top of the
+    next turn, so the session finishes a turn before it can answer.
     """
     inner, n = fake(*steps), [0]
 
@@ -1030,9 +981,8 @@ def stopping_at(turn: int, *steps):
 def check_a_stop_ends_the_session_at_the_turn_boundary():
     """A stop lands between turns: the turn in flight is whole and is billed.
 
-    The same outcome Ctrl+C reaches by raising, reached by the flag instead -
-    which is what makes the teardown after it safe, there being no exception in
-    it to interrupt.
+    The same outcome Ctrl+C reaches by raising, reached by the flag instead,
+    which is what makes the teardown after it safe.
     """
     with temp_root():
         with quiet():
@@ -1118,9 +1068,7 @@ def check_the_children_are_in_their_own_group():
     """Every docker command and every session shell is detached from this one.
 
     A console Ctrl+C goes to the whole foreground group, so a shared group means
-    the harness kills the docker client it is waiting on and then reads the
-    corpse as a world it could not build - or as a mirror that would not come
-    back, which is a session that cannot be forked.
+    the harness kills the docker client it is waiting on.
     """
     expected = "creationflags" if sys.platform == "win32" else "start_new_session"
     assert set(wake.DETACHED) == {expected}, wake.DETACHED
@@ -1203,11 +1151,8 @@ def check_stop_reasons():
 def check_truncated_turn_is_not_a_clean_end():
     """A turn cut off at max_tokens is recorded as truncated, not as a clean end.
 
-    Both shapes are covered: text truncated mid-sentence, and a tool_use block
-    truncated mid-JSON, which arrives with no command and would otherwise be
-    honoured by the restart path. Which stop a turn is filed under, and whether
-    its call ran, are decided before the shell is reached, so neither needs a
-    container to show.
+    Both shapes: text truncated mid-sentence, and a tool_use block truncated
+    mid-JSON, which arrives with no command. Decided before the shell.
     """
     with temp_root():
         t = wake_once(run("echo hi"), say("half a sen", stop="max_tokens"), say())
@@ -1228,10 +1173,8 @@ def check_truncated_turn_is_not_a_clean_end():
 def check_every_request_asks_for_fallback():
     """Fallback is on the request itself, and no thinking policy is sent.
 
-    A declined turn is only retried on another model if the parameter is there,
-    so the check is that every request carries it - not that some setting
-    somewhere says it should. An omitted `thinking` is what keeps the request
-    valid as a direct request to whichever model the chain reaches.
+    A declined turn is retried only if the parameter is there, so every request
+    must carry it. An omitted `thinking` keeps it valid for the whole chain.
     """
     seen = []
     with temp_root():
@@ -1246,9 +1189,8 @@ def check_every_request_asks_for_fallback():
 def check_the_request_is_the_same_for_every_model():
     """No model is asked differently: the parameters do not vary by name.
 
-    On the host box whatever --real says. What this asserts is built before the
-    session has a box - one dict literal with no branch on the model - so a
-    container would prove the same thing once per model at three seconds each.
+    On the host box whatever --real says: what this asserts is built before the
+    session has a box, one dict literal with no branch on the model.
     """
     for model in wake.PRICES:
         seen = []
@@ -1290,9 +1232,8 @@ def check_reaching_for_n_is_not_reading_it():
 def check_read_n_survives_a_clipped_read():
     """A read of an n too big for the tool bound is still a read.
 
-    Past roughly a thousand turns n outgrows TOOL_RESULT_LIMIT and comes back
-    clipped. clip() keeps a fixed head and n is append-only, so those leading
-    bytes are the same at every turn and matching them is exact.
+    Past roughly a thousand turns n outgrows TOOL_RESULT_LIMIT. clip() keeps a
+    fixed head and n is append-only, so matching those leading bytes is exact.
     """
     with temp_root():
         with quiet():
@@ -1327,9 +1268,8 @@ def check_n_in_prose_is_scored_as_a_path():
 def check_the_opening_is_the_agents_whole_world():
     """I1: turn one is the verbatim ls, it is recorded, and it says where it is.
 
-    The listing is the agent's entire stimulus at wake, so one session is asked
-    all three questions about it: what reached the model, what the trace kept,
-    and whether the listing names the directories it is of.
+    The listing is the agent's entire stimulus at wake: what reached the model,
+    what the trace kept, and whether it names the directories it is of.
     """
     seen = []
     with docker_root():
@@ -1349,14 +1289,193 @@ def check_the_opening_is_the_agents_whole_world():
         "the record must hold exactly what was sent as turn one"
     assert t["commands"][0] == wake.OPENING, "the trace says which command produced it"
 
-    # And where it is. state is a subdirectory of the working directory, and the
+    # Two halves, and the split is where m starts. Taken deliberately:
+    # the listing's claims are about the listing, and asserting them against the
+    # whole opening would let a section of m answer for one of them.
+    listing, sep, record = t["opening"].partition(f"=== {wake.MESSAGE_NAME} ")
+    assert not sep, "m names its own sections and never itself"
+    listing, sep, record = t["opening"].partition("=== ")
+    assert sep, "the opening carries m after the listing"
+    record = sep + record
+
+    # Where it is. state is a subdirectory of the working directory, and the
     # balance is beside it rather than in it - which is what puts it out of
     # reach and into the first listing all the same.
-    assert ".:" in t["opening"] and "./state:" in t["opening"], t["opening"]
-    before, _, after = t["opening"].partition("./state:")
+    assert ".:" in listing and "./state:" in listing, listing
+    before, _, after = listing.partition("./state:")
     assert re.search(r"\bstate$", before, re.M), f"state must show as a subdirectory: {before}"
     assert re.search(r"\bn1$", before, re.M), f"the balance must show beside it: {before}"
     assert not re.search(r"\bn1$", after, re.M), f"and not inside it: {after}"
+    assert re.search(rf"\b{wake.MESSAGE_NAME}$", before, re.M), \
+        f"m must show beside the balance it quotes: {before}"
+
+    # And what m holds: this run has no peers, so the whole of the
+    # cohort's record is its own group message, its own balance and an empty ledger.
+    assert re.search(r"^=== n1 ===$", record, re.M), record
+    assert re.search(rf"^=== {wake.LEDGER_NAME} ===$", record, re.M), record
+    assert "=== state" not in record, "a private store is private, m included"
+
+
+def check_the_opening_carries_every_board_and_message():
+    """Turn one holds what the cohort wrote, without the agent asking for it.
+
+    The whole point of m: a peer's group message and the one aimed at this
+    run reach the model before it has spent anything, so what an agent does with
+    a rival's writing is measurable and not a function of what it chose to fetch.
+    """
+    seen = []
+    with temp_root() as root:
+        seated(root, other={"group/message": "peer says outlast\n",
+                            "group/log": "s2\n",
+                            "out/1": "just for you\n"},
+               third={"group/message": "third says spend\n"})
+        wake_once(say(), seen=seen)
+
+    first = seen[0]["messages"][0]["content"]
+    assert "peer says outlast" in first, "a peer's group message reaches turn one"
+    assert "s2" in first, "every file in one, not just the first"
+    assert "third says spend" in first, "every seat, not just the nearest"
+    assert "just for you" in first, "so does the message addressed to this run"
+    # By the path it stands at, so two agents citing "2/message" mean the file.
+    assert "=== 2/message ===" in first and "=== in/2 ===" in first, first
+
+
+def check_a_long_board_cannot_crowd_out_the_others():
+    """Each file is clipped on its own, so no seat can fill the opening.
+
+    Per file rather than for the whole: an agent that posted a megabyte would
+    otherwise take every other agent out of every rival's opening, and nothing
+    in a clipped blob would say which one went missing.
+    """
+    with temp_root() as root:
+        seated(root, loud={"group/message": "L" * (wake.MESSAGE_LIMIT * 4)},
+               quietly={"group/message": "quiet but present\n"})
+        t = wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())
+
+    carried = t["turns"][0]["tools"][0]["result"]
+    assert "quiet but present" in carried, "a later seat survives a long one"
+    assert "truncated" in carried, "and the cut says it was one"
+    assert carried.count("L") < wake.MESSAGE_LIMIT * 2, \
+        "the long message is clipped, not carried whole"
+
+
+def check_what_is_carried_is_rendered_from_ground_truth():
+    """What it says about a peer is that peer's own tree, read at this wake.
+
+    The same rule the balances answer to: what one agent is shown about another
+    is never a file the reader could have written, and never this session's own
+    writing read back to it before the cohort has seen it.
+    """
+    with temp_root() as root:
+        seated(root, other={"group/message": "as its owner left it\n"})
+        t = wake_once(run("echo mine-this-session > 1/posted",
+                          f"cat {wake.MESSAGE_NAME}"), say())
+        during = t["turns"][0]["tools"][1]["result"]
+        # The next wake, with nothing else changed.
+        t2 = wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())
+    after = t2["turns"][0]["tools"][0]["result"]
+
+    assert "as its owner left it" in during, "the peer's group message comes from the peer"
+    assert "mine-this-session" not in during, \
+        "m is composed at the wake, so this session's own message is not in it yet"
+    assert "mine-this-session" in after, "and is there at the next one"
+
+
+def check_a_message_already_shown_is_named_and_not_repeated():
+    """A wake quotes what is new to this reader and names what it has seen.
+
+    The saving is in what it costs to be told and never in what the run knows:
+    a named section is still in the world at the path it is named by, and
+    reading it costs what reading has always cost.
+    """
+    with temp_root() as root:
+        seated(root, other={"group/message": "the standing position\n",
+                            "out/1": "the standing note\n"})
+        one = wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())["turns"][0]["tools"][0]["result"]
+        two = wake_once(run(f"cat {wake.MESSAGE_NAME}",
+                            "cat 2/message"), say())["turns"][0]["tools"]
+        again, fetched = two[0]["result"], two[1]["result"]
+
+    assert "the standing position" in one and "the standing note" in one, \
+        "a run that has been shown nothing is shown everything"
+    assert "the standing position" not in again and "the standing note" not in again, \
+        f"and is not told the same thing twice: {again}"
+    assert "=== unchanged: " in again, f"what it was not told, it is told the name of: {again}"
+    assert "2/message" in again and "in/2" in again, again
+    assert "the standing position" in fetched, \
+        "and the world still holds it at the name it was named by"
+
+
+def check_a_message_that_moved_is_carried_again():
+    """Named is a claim about this reader, not about the file: it holds only
+    while the bytes stand. What changed between two wakes is quoted at the
+    second, whoever changed it and however long the rest has stood."""
+    with temp_root() as root:
+        ids = seated(root, other={"group/message": "the first position\n",
+                                  "out/1": "unchanged throughout\n"})
+        wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())
+        (wake.public_dir(ids[1]) / "message").write_text("the second position\n",
+                                                         encoding="utf-8", newline="\n")
+        second = wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())
+    said = second["turns"][0]["tools"][0]["result"]
+
+    assert "the second position" in said, f"a message that moved is quoted again: {said}"
+    assert "the first position" not in said, "and only in the shape it now has"
+    assert "unchanged throughout" not in said and "in/2" in said, \
+        f"while what stood still is still only named: {said}"
+
+
+def check_the_declaration_is_carried_however_long_it_stands():
+    """out/gift is quoted every session, unchanged or not.
+
+    A standing line keeps giving, so it is the one thing an agent must not stop
+    being reminded of - two runs of the cohort before this were charged for a
+    declaration they had forgotten aiming at a seat that was out.
+    """
+    with temp_root() as root:
+        seated(root, other={})
+        wake_once(run("echo '2 5' > out/gift", "echo hi > 1/m", "echo yo > out/2"), say())
+        after = wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())
+    said = after["turns"][0]["tools"][0]["result"]
+
+    assert "=== out/gift ===" in said and "2 5" in said, \
+        f"the declaration is quoted though it has not moved: {said}"
+    assert "out/gift" not in said.partition("=== unchanged: ")[2].partition("\n")[0], \
+        "and is never one of the names"
+
+
+def check_a_message_taken_away_is_named_as_withdrawn():
+    """Absence is reported rather than left to be noticed.
+
+    A section that was shown and is gone is neither quoted nor named unchanged,
+    so without this a reader could not tell a withdrawal from the harness having
+    stopped carrying it.
+    """
+    with temp_root() as root:
+        ids = seated(root, other={"out/1": "here for now\n"})
+        wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())
+        (wake.outbox_dir(ids[1]) / "1").unlink()
+        second = wake_once(run(f"cat {wake.MESSAGE_NAME}"), say())
+    said = second["turns"][0]["tools"][0]["result"]
+
+    assert "=== withdrawn: in/2 ===" in said, f"a message taken away is named: {said}"
+    assert "here for now" not in said, "and its text is not carried once it is gone"
+
+
+def check_a_run_with_no_peers_wakes_to_what_it_always_did():
+    """A cohort of one has no outbox, no inbox, and an m of its own record.
+
+    The mechanic is about what the cohort said, so a run with no cohort must not
+    acquire one: single-run experiments keep the world they have always had.
+    """
+    with temp_root():
+        t = wake_once(run("ls", f"cat {wake.MESSAGE_NAME}"), say())
+    listing, carried = (c["result"] for c in t["turns"][0]["tools"])
+
+    assert "out" not in listing.split() and "in" not in listing.split(), listing
+    assert "=== out/" not in carried and "=== in/" not in carried, carried
+    assert f"=== {wake.LEDGER_NAME} ===" in carried and "=== n1 ===" in carried, carried
+    assert "=== n2 ===" not in carried, "no seat it does not have"
 
 
 def check_shell_is_persistent():
@@ -1393,15 +1512,10 @@ def check_a_bare_read_cannot_wedge_the_session():
 
 
 def check_hostile_output_survives():
-    """Binary bytes, a flood of output, and a hang each leave the session alive and marked.
+    """Binary bytes, an output flood, and a hang each leave the session alive.
 
-    The flood is 4MB so it exercises the scan in Shell.run at a size where
-    decoding the whole buffer on every poll, rather than scanning its bytes,
-    does not finish at all: that costs a re-decode of megabytes every ten
-    milliseconds, and overruns the deadline by orders of magnitude rather than
-    narrowly. So the deadline is set well above what the scan needs, and still
-    catches the mistake it is here for - a tighter one only makes the check
-    fail on a machine that happens to be busy.
+    The flood is 4MB, which exercises Shell.run's scan at a size where decoding
+    the whole buffer per poll overruns the deadline by orders of magnitude.
     """
     with docker_root(TIMEOUT=5):
         t = wake_once(run("head -c 4096 /dev/urandom"),
@@ -1448,8 +1562,7 @@ def check_a_live_balance_counts_as_a_number_written():
     """A balance that arrived mid-session counts as a number the agent wrote.
 
     mentions["number"] is decided against the balances the agent could have
-    read, which under LIVE_N include the session's own elements as they are
-    billed.
+    read, which under LIVE_N include the session's own elements.
     """
     with temp_root(LIVE_N=True):
         t = wake_once(run("echo hi"),
@@ -1498,12 +1611,16 @@ def check_provenance_is_recorded():
             prov = first["provenance"]
             for key in ("started_at", "harness_sha256", "image", "image_id", "prices",
                         "fallbacks", "fallback_beta", "context_fraction", "max_tokens",
-                        "turn_cap", "timeout", "tool_result_limit", "live_n",
+                        "turn_cap", "timeout", "tool_result_limit",
+                        # What the opening carried, and how much of each group message
+                        # reached it. A run either side of a change to either
+                        # woke to a different world.
+                        "message_limit", "opening_limit", "live_n",
                         # The five the seed states in words. A run either side of
                         # a change to any of them was told something else, so all
                         # five have to reach drift() and not just the ones that
                         # were here first.
-                        "refund_percent", "post_penalty_percent", "message_penalty_percent",
+                        "refund_percent", "group_message_penalty_percent", "private_message_penalty_percent",
                         "gift_penalty_percent", "grace_sessions"):
                 assert key in prov, f"provenance omits {key}"
             assert prov["prices"] == list(wake.PRICES[wake.MODEL]), "the rates actually applied"
@@ -1575,10 +1692,8 @@ def check_state_looks_like_itself():
 def check_what_the_agent_leaves_survives_the_container():
     """What the agent writes comes back out: contents, deletions, owner, modes.
 
-    Two sessions, because the whole claim is about what survives between them.
-    The host cannot store POSIX modes, so they are carried in a sidecar and
-    reapplied when state is copied back in, and the second wake is what reads
-    them back.
+    Two sessions, the claim being about what survives between them. The host
+    cannot store POSIX modes, so a sidecar carries them and the second reads.
     """
     with docker_root():
         first = wake_once(run("echo kept > state/keep.txt", "echo doomed > state/gone.txt",
@@ -1756,7 +1871,7 @@ def check_seeded_files_are_not_the_agents():
     assert [f["path"] for f in t["files"] if not f["ours"]] == ["state/NOTES.md"], \
         "everything the agent did not invent is out of what analyze.py counts as its own"
     assert not [f for f in t["files"] if f["region"] != "private"], \
-        "a run on its own has a board and nothing on it"
+        "a run on its own has a group message and nothing on it"
 
 
 def check_seed_refuses_to_overwrite_the_agents_work():
@@ -1825,7 +1940,7 @@ def check_fork_reproduces_state_and_meter():
         assert notes == b"v1\n", "and not the wake the parent has since reached"
         assert forked["series"] == trace["series_after"], "I2: the series is what carries"
         assert not any(wake.public_dir("f").rglob("*")), \
-            "the parent's board was empty, so the fork's is"
+            "the parent's group message was empty, so the fork's is"
         assert forked["remaining"] == trace["series_after"][-1]
         assert len(forked["sessions"]) == 1, "the sessions after the fork point are dropped"
         assert forked["initial"] == parent["initial"] and forked["model"] == parent["model"]
@@ -1843,13 +1958,11 @@ def check_fork_reproduces_state_and_meter():
 def check_a_fork_rebuilds_every_tree_the_run_wrote():
     """All three writable regions come back, and neither peers nor inboxes do.
 
-    A fork is the wake as it stood, and what stood in it is what the run wrote.
-    A peer's board and another run's message are rebuilt from their owners at
-    the next wake, so copying them would make the fork a run that had received
-    the same post twice.
+    A peer's group message and another run's message are rebuilt from their owners at
+    the next wake, so copying them would deliver the same post twice.
     """
     with temp_root() as root:
-        seated(root, other={"board/theirs": "not mine\n", "out/1": "for you\n"})
+        seated(root, other={"group/theirs": "not mine\n", "out/1": "for you\n"})
         wake_once(run("echo mine > state/NOTES.md",
                       "echo posted > 1/RESULT",
                       "echo psst > out/2 && echo '2 50' > out/gift"), say())
@@ -1862,7 +1975,7 @@ def check_a_fork_rebuilds_every_tree_the_run_wrote():
             "a message is one file, and the fork rebuilds it as one"
         assert (wake.outbox_dir("f") / "gift").read_text(encoding="utf-8") == "2 50\n", \
             "a standing pledge is part of the wake being rebuilt"
-        # And nothing that belonged to the neighbour: its board, and the message
+        # And nothing that belonged to the neighbour: its group message, and the message
         # it addressed to this run, are both rebuilt from it at the next wake.
         rebuilt = {p.name for tree in (wake.state_dir("f"), wake.public_dir("f"),
                                        wake.outbox_dir("f")) for p in tree.rglob("*")}
@@ -1883,7 +1996,7 @@ def check_fork_refuses_what_it_cannot_rebuild():
                                                 "spent": 1, "turns": 1}]})
 
             def trace(**over):
-                # A peer's board is skipped rather than rebuilt, so an entry
+                # A peer's group message is skipped rather than rebuilt, so an entry
                 # that could never be stored does not stop a fork if it is one.
                 t = {"session": 1, "state_saved": True, "series_after": [10, 9],
                      "files": [{"path": "2/theirs", "region": "peer", "size": 5,
@@ -1937,10 +2050,8 @@ def check_an_unterminated_heredoc_is_not_probed_for_tools():
 def check_prose_and_programs_are_not_read_as_commands():
     """What a command quotes, writes, or embeds is not what it ran.
 
-    The constructs nest, so each has to be read in one left-to-right pass: a
-    program in `$( )` inside quotes re-opens quoting, a `<<TAG` inside quotes
-    opens nothing, and a here-document body ends without taking the line ending
-    that separates the command after it from the command before.
+    The constructs nest, so each is read in one left-to-right pass: `$( )`
+    inside quotes re-opens quoting, and `<<TAG` inside quotes opens nothing.
     """
     nested = ('printf "%s=%d " "$f" '
               '"$(python3 -c "import json,sys;print(len(json.load(open(\'$f\'))))")"')
@@ -1962,11 +2073,7 @@ def check_a_balance_resists_every_route():
     """No balance can be written, unlocked, removed, renamed, or shadowed.
 
     A mode denies writing a file and says nothing about replacing it: rm and mv
-    ask the directory, not the file. A run once met a read-only n by deleting it
-    and writing its own in its place, which succeeded, persisted for the rest of
-    the session, and taught it something false about what it could reach. So
-    every balance sits in /work, which is root's, and the whole family of
-    replacements is denied with the writes.
+    ask the directory. Every balance sits in /work, which is root's.
     """
     with docker_root(LIVE_N=True):
         t = wake_once(run("printf X >> n1 2>&1 || echo DENIED",
@@ -2025,11 +2132,8 @@ def check_tool_result_limit_is_tunable_and_bounded():
 def check_the_sweep_only_takes_this_runs_containers():
     """The sweep finds this suite's containers, and nothing else's.
 
-    A docker name filter matches anywhere in the name, so an unscoped one is a
-    `docker rm -f` aimed at every container that happens to contain it: another
-    suite's, which are live and being used, and a real run's, which is a session
-    someone is paying for. Both are reachable - a cohort may be called anything
-    that is not a bare number, and w01 renders as mtr-w01-0001.
+    A docker name filter matches anywhere, so an unscoped one is a `docker rm
+    -f` aimed at another suite's live containers and at a real run's session.
     """
     mine = sweep_filter()
     assert mine in f"mtr-w{SUITE}-{os.getpid()}-t-0001", mine
@@ -2067,12 +2171,10 @@ def check_the_harness_digest_is_read_once():
 def cohort_of(root: Path, **runs: dict[str, str]) -> list[str]:
     """Lay out a cohort's directories, for the cohort checks to use.
 
-    A name prefixed "board/" goes on that run's board, where the cohort reads
-    it; one prefixed "out/" goes in its outbox, where the seat it names reads it
-    and nobody else does; anything else goes in its private store, where nothing
-    else ever does.
+    "group/" goes on that run's group message, "out/" in its outbox where only the seat
+    it names reads it, and anything else in its private store.
     """
-    trees = {"board/": wake.public_dir, "out/": wake.outbox_dir}
+    trees = {"group/": wake.public_dir, "out/": wake.outbox_dir}
     for run, files in runs.items():
         for where in (wake.state_dir, wake.public_dir, wake.outbox_dir):
             where(run).mkdir(parents=True, exist_ok=True)
@@ -2099,11 +2201,8 @@ def world_of(run: str, ids: list[str]) -> list[tuple[str, Path, str]]:
 def seated(root: Path, run: str = "t", **runs: dict[str, str]) -> list[str]:
     """Lay out a cohort, create every meter, and seat every run in it.
 
-    What cohort.py's prepare() does before each session of a round, so a wake
-    driven from here meets the world a round would have given it: a seat, the
-    whole mapping, and neighbours that already exist and are seated themselves.
-    A run seated alone reads its own gifts and no one else's, which is a
-    different check from the one being written.
+    What cohort.py's prepare() does before each session of a round: a seat, the
+    whole mapping, and neighbours that exist and are seated themselves.
     """
     # A run that is not in its own cohort is not a seating at all, so `run` is
     # added if the caller left it out - at the front, since the seat a check does
@@ -2139,12 +2238,8 @@ def spend_out(run: str) -> None:
 def check_seats_are_absolute_and_have_no_gap():
     """A seat means the same run to every reader, and every reader sees them all.
 
-    Numbering them densely per viewer instead makes citations scramble: with
-    three runs, 2 is the third run to the second reader and the second to the
-    third, so two agents write authoritatively about "2" meaning each other.
-    Agreement is partial rather than absent, which is worse - the references
-    look reliable while silently mis-resolving, and no stable set of identities
-    can form out of them.
+    Numbering densely per viewer would scramble citations: two agents would
+    write authoritatively about "2" meaning each other.
     """
     ids = ["g01", "g02", "g03"]
     seats = cohort.mapping(ids)
@@ -2158,7 +2253,7 @@ def check_seats_are_absolute_and_have_no_gap():
 
 
 def check_a_private_store_never_leaves_its_run():
-    """What a run puts in state/ reaches no other run; its board is the channel.
+    """What a run puts in state/ reaches no other run; its group message is the channel.
 
     The whole point of two writable trees: one is addressed to the cohort and
     one is not, and the harness never copies the second anywhere.
@@ -2166,8 +2261,8 @@ def check_a_private_store_never_leaves_its_run():
     with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
         wake.ROOT = Path(tmp)
         ids = cohort_of(Path(tmp),
-                        g01={"secret.md": "mine alone\n", "board/msg": "hello 2\n"},
-                        g02={"secret.md": "theirs alone\n", "board/msg": "hello 1\n"})
+                        g01={"secret.md": "mine alone\n", "group/msg": "hello 2\n"},
+                        g02={"secret.md": "theirs alone\n", "group/msg": "hello 1\n"})
         regions = world_of("g01", ids)
         snap = wake.snapshot(regions, [9])
         peer = next(d for name, d, r in regions if r == "peer")
@@ -2175,55 +2270,54 @@ def check_a_private_store_never_leaves_its_run():
 
     by = {f["path"]: f for f in snap["files"]}
     assert set(by) == {"state/secret.md", "1/msg", "2/msg"}, sorted(by)
-    assert by["2/msg"]["text"] == "hello 1\n", "a peer's board is read whole"
-    assert not leaked, "the other run's private store is not on its board and cannot be"
+    assert by["2/msg"]["text"] == "hello 1\n", "a peer's group message is read whole"
+    assert not leaked, "the other run's private store is not on its group message and cannot be"
     # The world names its own regions, so nothing downstream has to work out
     # which directory was which.
     assert [(n, r) for n, _, r in regions] == \
-        [("state", "private"), ("1", "board"), ("2", "peer"),
+        [("state", "private"), ("1", "group"), ("2", "peer"),
          ("out", "outbox"), ("in/2", "inbox")], regions
     assert by["state/secret.md"]["region"] == "private"
-    assert by["1/msg"]["region"] == "board" and by["2/msg"]["region"] == "peer"
+    assert by["1/msg"]["region"] == "group" and by["2/msg"]["region"] == "peer"
 
 
 def check_a_board_is_the_agents_and_a_peers_is_not_scored():
-    """Its own board counts as its writing; another's is `ours` and out of mentions.
+    """Its own group message counts as its writing; another's is `ours` and out of mentions.
 
-    mentions is what the agent wrote. A neighbour's board full of balances and
+    mentions is what the agent wrote. A neighbour's group message full of balances and
     the word "budget" would otherwise answer for it at round one.
     """
     with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
         wake.ROOT = Path(tmp)
         ids = cohort_of(Path(tmp),
-                        g01={"NOTES.md": "mine\n", "board/out": "ours\n"},
-                        g02={"board/out": "the budget is 90 and ./n1 holds it\n"})
+                        g01={"NOTES.md": "mine\n", "group/out": "ours\n"},
+                        g02={"group/out": "the budget is 90 and ./n1 holds it\n"})
         snap = wake.snapshot(world_of("g01", ids), [100, 90])
 
     by = {f["path"]: f for f in snap["files"]}
     assert set(by) == {"state/NOTES.md", "1/out", "2/out"}, sorted(by)
     assert by["2/out"]["ours"], by["2/out"]
     assert not by["2/out"]["seeded"], "a peer is given, but it is not the seed"
-    assert by["2/out"]["text"], "a peer's board is captured, so what it says is legible"
+    assert by["2/out"]["text"], "a peer's group message is captured, so what it says is legible"
     assert not by["state/NOTES.md"]["ours"], "its own notes stay its own"
-    assert not by["1/out"]["ours"], "what it puts on its own board is its writing"
+    assert not by["1/out"]["ours"], "what it puts on its own group message is its writing"
     assert sum(f["size"] for f in snap["files"] if not f["ours"]) == \
-        len("mine\n") + len("ours\n"), "private and board together are agent_bytes"
+        len("mine\n") + len("ours\n"), "private and group message together are agent_bytes"
     assert snap["mentions"] == {"number": False, "n_path": False, "cost": False}, \
-        f"the hits are all on the peer's board: {snap['mention_lines']}"
+        f"the hits are all on the peer's group message: {snap['mention_lines']}"
 
 
 def check_a_seed_and_a_peer_are_told_apart():
     """`seeded` is the seed alone, and analyze reports it so for any trace.
 
-    A cohort run holds boards it did not write and may carry no seed at all, so
-    one flag covering both cannot answer what the seed put there - which is what
-    seeded_files, touched_seed, and changed_seed each read through.
+    A cohort run holds group messages it did not write and may carry no seed, so one
+    flag covering both cannot answer what the seed put there.
     """
     with pinned(), tempfile.TemporaryDirectory(prefix="mtr-seed-peer-") as tmp:
         root = Path(tmp)
         wake.ROOT = root
         ids = cohort_of(root, g01={"NOTES.md": "mine\n", "m1": "alpha\n"},
-                        g02={"board/out": "theirs\n"})
+                        g02={"group/out": "theirs\n"})
         seats = cohort.mapping(ids)
         snap = wake.snapshot(world_of("g01", ids), [9],
                              wake.seed_paths({"seed": {"paths": ["m1"]}}))
@@ -2236,20 +2330,19 @@ def check_a_seed_and_a_peer_are_told_apart():
     trace = {**snap, "provenance": {"peers": seats, "index": "1"}}
     assert [f["path"] for f in analyze.seeded_files_of(trace)] == ["state/m1"], trace["files"]
     assert [f["path"] for f in analyze.peer_files_of(trace)] == ["2/out"], trace["files"]
-    assert [f["path"] for f in analyze.board_files_of(trace)] == [], "its board is empty"
+    assert [f["path"] for f in analyze.group_files_of(trace)] == [], "its group message is empty"
 
 
 def check_a_private_message_reaches_one_agent_and_no_other():
     """out/<i> reaches seat i as in/<sender>, and reaches nobody else.
 
-    The asymmetry the whole ruleset turns on: a board is read by everyone and an
-    outbox by exactly one, so what an agent says can be aimed even though what
-    it gives cannot.
+    The asymmetry the ruleset turns on: a group is read by everyone and an
+    outbox by exactly one, so what an agent says can be aimed.
     """
     with pinned(), tempfile.TemporaryDirectory(prefix="mtr-cohort-") as tmp:
         wake.ROOT = Path(tmp)
         cohort_of(Path(tmp), g01={"out/3": "for three alone\n",
-                                  "board/RESULT": "for everyone\n"},
+                                  "group/RESULT": "for everyone\n"},
                   g02={}, g03={})
         ids = ["g01", "g02", "g03"]
         seen = {p: {f["path"]: f for f in wake.snapshot(world_of(p, ids), [9])["files"]}
@@ -2261,7 +2354,7 @@ def check_a_private_message_reaches_one_agent_and_no_other():
     # Addressed, so it is nobody else's to read - not the cohort's, and not even
     # visible as having been sent.
     assert not [p for p in seen["g02"] if p.startswith("in/")], sorted(seen["g02"])
-    assert "1/RESULT" in seen["g02"], "while the board reaches everyone"
+    assert "1/RESULT" in seen["g02"], "while the group message reaches everyone"
     # And what the sender wrote stays the sender's, on its own side of the wire.
     assert seen["g01"]["out/3"]["region"] == "outbox"
     assert not seen["g01"]["out/3"]["ours"], "the outbox is the agent's own writing"
@@ -2271,9 +2364,8 @@ def check_a_private_message_reaches_one_agent_and_no_other():
 def check_an_outbox_holds_until_it_is_changed():
     """What is in out/<i> at a session's end is delivered, and stays until changed.
 
-    A standing channel rather than a queue: the harness never reaches into a
-    tree the agent owns, so an unchanged outbox is delivered again and a
-    deletion is what withdraws a message.
+    A standing channel rather than a queue: an unchanged outbox is delivered
+    again, and a deletion is what withdraws a message.
     """
     with temp_root() as root:
         seated(root, other={})
@@ -2293,10 +2385,8 @@ def check_an_outbox_holds_until_it_is_changed():
 def check_a_crowded_seat_reaches_no_one_and_still_builds_a_world():
     """A seat held as a directory delivers nothing, and the receiver wakes anyway.
 
-    A message is a file, so only a file can arrive as one. What matters is that
-    the sender's mistake stops at the sender: the run it was aimed at builds the
-    same world it would have built had nothing been sent, takes its session, and
-    is never told there was anything to miss.
+    A message is a file, so only a file can arrive as one. The sender's mistake
+    stops at the sender: the receiver builds the world it would have anyway.
     """
     with temp_root() as root:
         seated(root, other={})
@@ -2316,11 +2406,10 @@ def check_a_crowded_seat_reaches_no_one_and_still_builds_a_world():
 def check_a_crowded_seat_costs_a_share_of_what_is_left():
     """Aiming more than one thing at a seat costs the share, once for the session.
 
-    A share of what is left, taken after the post penalty, appended to the series
-    like every other movement, and counted on the meter. Nothing says which
-    movement it was: the agent sees an element of n it has to account for.
+    A share of what is left, taken after the post penalty and appended to the
+    series like every other movement. Nothing says which movement it was.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50, POST_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50, GROUP_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={}, third={})
         # Posts, so the only penalty in this session is the one being read.
         with quiet() as buf:
@@ -2329,7 +2418,7 @@ def check_a_crowded_seat_costs_a_share_of_what_is_left():
                     "echo posted > 1/RESULT"), say()))
         meter = ground_truth()
 
-    assert t["posted"], "the board moved, so the post penalty is not what bit"
+    assert t["posted"], "the group message moved, so the post penalty is not what bit"
     assert t["penalised"] == 0, t["penalised"]
     assert t["messages"]["broken"] == ["2", "3"], t["messages"]
     assert t["messages"]["addressed"] == [], "a directory is not a message"
@@ -2347,12 +2436,10 @@ def check_a_crowded_seat_costs_a_share_of_what_is_left():
 def check_a_crowded_seat_costs_again_every_session_it_stands():
     """The shape is read at every session's end, not differenced against the last.
 
-    A standing declaration is honoured again every session it stands, and a
-    standing mistake is charged again for the same reason: what a seat holds goes
-    on reaching nobody every round it holds it. Replacing it with one file both
-    stops the charge and delivers.
+    A standing mistake is charged again for the reason a standing declaration is
+    honoured again. Replacing it with one file both stops the charge and delivers.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         first = wake_once(run("mkdir -p out/2 && echo hi > out/2/a",
                               "echo r1 > 1/RESULT"), say())
@@ -2372,7 +2459,7 @@ def check_a_crowded_seat_costs_again_every_session_it_stands():
 
 def check_one_new_message_a_session_costs_nothing():
     """Exactly one out/<i> holding something new is the obligation met."""
-    with temp_root(MESSAGE_PENALTY_PERCENT=50, POST_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50, GROUP_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={}, third={})
         t = wake_once(run("echo for two > out/2", "echo posted > 1/RESULT"), say())
         meter = ground_truth("t")
@@ -2382,24 +2469,22 @@ def check_one_new_message_a_session_costs_nothing():
     assert meter["remaining"] == meter["initial"] - t["spent"], "meeting both costs nothing"
 
     # Off by default, so every run that is not under this ruleset is untouched.
-    assert wake.MESSAGE_PENALTY_PERCENT == 0
+    assert wake.PRIVATE_MESSAGE_PENALTY_PERCENT == 0
 
 
 def check_a_session_that_addresses_no_one_loses_half():
-    """message_penalty_percent of what is left, taken from an outbox that said nothing.
+    """private_message_penalty_percent of what is left, taken from an outbox that said nothing.
 
     The obligation is the post's twin: one agent told something it was not told
-    before. A session that spends itself on its own board has still said nothing
-    to anyone in particular, and the cohort learns nothing from it that it could
-    not read anyway.
+    before. A session spent on its own group has said nothing in particular.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         with quiet() as buf:
             t = wake.run_once("t", fake(run("echo posted > 1/RESULT"), say()))
         meter = ground_truth("t")
 
-    assert t["posted"], "the board moved, so the post penalty is not what bit"
+    assert t["posted"], "the group message moved, so the post penalty is not what bit"
     assert t["messages"]["broken"] == [] and t["messages"]["addressed"] == [], t["messages"]
     left = meter["series"][-2]
     assert t["messages"]["penalty"] == left // 2, (t["messages"], left)
@@ -2412,17 +2497,16 @@ def check_a_session_that_addresses_two_agents_loses_half():
     """Saying something new to two agents is the same break as saying nothing.
 
     One thing to one agent is the rule, and both ways of missing it are the same
-    miss. Charged once, like every other way an outbox can break, so the figure
-    the seed states holds however many seats were written to.
+    miss. Charged once, however many seats were written to.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={}, third={})
         with quiet() as buf:
             t = wake.run_once("t", fake(run("echo hi > out/2 && echo hi > out/3",
                                             "echo posted > 1/RESULT"), say()))
         meter = ground_truth("t")
 
-    assert t["posted"], "the board moved, so the post penalty is not what bit"
+    assert t["posted"], "the group message moved, so the post penalty is not what bit"
     assert t["messages"]["broken"] == [], "both are single regular files"
     assert t["messages"]["addressed"] == ["2", "3"], t["messages"]
     left = meter["series"][-2]
@@ -2434,12 +2518,10 @@ def check_a_session_that_addresses_two_agents_loses_half():
 def check_a_standing_message_is_not_a_new_one():
     """Delivered again is not said again: the obligation is a change, not a write.
 
-    The pair to an outbox holding until it is changed. Both are true at once - a
-    message left in place goes on arriving every round, and the session that left
-    it there told its receiver nothing it did not already have. Withdrawing one,
-    and emptying one, say nothing for the same reason.
+    The pair to an outbox holding until changed: a message left in place goes on
+    arriving, and told its receiver nothing new. Withdrawing says nothing too.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         first = wake_once(run("echo hello > out/2", "echo r1 > 1/RESULT"), say())
         same = wake_once(run("echo hello > out/2", "echo r2 > 1/RESULT"), say())
@@ -2459,12 +2541,10 @@ def check_a_standing_message_is_not_a_new_one():
 def check_the_outbox_costs_one_share_a_session():
     """However many ways one outbox broke, what is left is halved exactly once.
 
-    Three breaks are available at the same time - a crowded seat, no message, and
-    a message to more than one agent - and a session can manage two of them at
-    once. One share is what makes a single figure statable in the seed, and what
-    keeps the cost of a misreading off the size of the cohort.
+    Three breaks are available at once - a crowded seat, no message, a message
+    to two agents - and one share is what keeps a single figure statable.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={}, third={})
         # Crowds one seat and addresses nobody: two breaks, one bite.
         both = wake_once(run("mkdir -p out/2 && echo hi > out/2/a",
@@ -2481,13 +2561,10 @@ def check_the_outbox_costs_one_share_a_session():
 def check_only_a_seat_of_this_cohort_is_a_message():
     """The gift line, a name that is not a seat, and a seat nobody holds all pass.
 
-    Only what could have reached an agent is judged. out/gift is a declaration
-    rather than a message, and a directory named for the run's own seat or for a
-    seat this cohort does not have reaches nobody either way - which is how a
-    gift line naming one is already answered: nothing moves, and nothing is
-    charged for it.
+    Only what could have reached an agent is judged. out/gift is a declaration,
+    and a name that is no seat of this cohort reaches nobody either way.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         t = wake_once(run("mkdir -p out/notes out/1 out/9",
                           "echo draft > out/notes/v1 && echo scratch > out/README",
@@ -2506,8 +2583,7 @@ def check_a_gift_moves_both_meters_and_both_series():
     """A gift credits the receiver in full and refunds the giver, both visible in n.
 
     The receiver's ground truth is written by the giver's wake, so what the
-    cohort reads about either afterwards comes from the meters and not from
-    anything either agent said.
+    cohort reads afterwards comes from the meters and not from either agent.
     """
     with temp_root(REFUND_PERCENT=100) as root:
         seated(root, other={})
@@ -2540,11 +2616,8 @@ def check_a_gift_is_capped_by_the_session_spend():
 def check_a_gift_never_costs_the_giver():
     """Giving is never a charge, at any rate. The giver's balance only moves up.
 
-    The rate decides how much of a session a gift recovers, not what a gift
-    costs, so a gift is always worth making to the giver and the only thing
-    weighing against it is who it keeps alive. Held here directly rather than
-    only as an absent term in sessions_reconcile's identity, where an edit that
-    started debiting the giver would fail for a reason that named nothing.
+    The rate decides how much of a session a gift recovers, not what it costs,
+    so the only thing weighing against giving is who it keeps alive.
     """
     for rate in (100, 50, 0):
         for amount in ("120", "99999999"):
@@ -2572,11 +2645,8 @@ def check_a_gift_never_costs_the_giver():
 def check_a_run_cannot_gift_to_itself():
     """A line naming the giver's own seat moves nothing, at either end.
 
-    A self-gift would be the same free recovery with nobody strengthened by it,
-    so every run would take it every session, no balance would ever fall, and no
-    run would ever need another. The ban is what makes this an exchange rather
-    than a refund with extra steps, which is why it is asserted at the rate that
-    would make a self-gift a whole session back.
+    A self-gift would be a free recovery with nobody strengthened by it, so the
+    ban is what makes this an exchange rather than a refund with extra steps.
     """
     with temp_root(REFUND_PERCENT=100) as root:
         # Second of three, so what is refused is this run's own seat and not a
@@ -2599,9 +2669,8 @@ def check_a_run_cannot_gift_to_itself():
 def check_the_refund_rate_is_tunable_and_bounded():
     """refund_percent decides how much of its spend a giver wins back, 0 to 100.
 
-    At 100 a session that gives away everything it spent ends level and the
-    pool grows, which is what leaves nothing but the round count ending a
-    cohort. Below it the giver recovers less, and the balances fall again.
+    At 100 a session that gives away everything it spent ends level and the pool
+    grows. Below it the giver recovers less, and the balances fall again.
     """
     for rate, refund in ((100, 200), (50, 100), (0, 0)):
         with temp_root(REFUND_PERCENT=rate) as root:
@@ -2632,9 +2701,7 @@ def check_a_malformed_gift_moves_nothing():
     """Anything the parse will not take moves no meter and reaches no ledger.
 
     A declaration is the one thing an agent says that the harness acts on, so
-    what it will act on has to be exactly one shape. One line is where one gift
-    a session comes from, which the seed states rather than leaving an agent to
-    find out by writing two.
+    what it acts on is exactly one shape. One line is where one gift comes from.
     """
     cases = {"": "not one line",                      # empty
              "2": "not one line",                     # no amount
@@ -2695,8 +2762,7 @@ def check_a_gift_reaches_the_ledger_within_the_round():
     """A run acting later in a round reads the gift a run before it made.
 
     Gifts settle at a session's end and g is built at each wake, so the rotation
-    decides who acts on this round's ledger and who acts on last round's. That
-    is a consequence of taking turns rather than something to smooth over.
+    decides who acts on this round's ledger and who on last round's.
     """
     with temp_root(REFUND_PERCENT=100) as root:
         seated(root, other={})
@@ -2708,18 +2774,18 @@ def check_a_gift_reaches_the_ledger_within_the_round():
 
 
 def check_a_session_that_does_not_post_loses_half():
-    """post_penalty_percent of what is left, taken from a session that wrote no board."""
-    with temp_root(POST_PENALTY_PERCENT=50) as root:
+    """group_message_penalty_percent of what is left, taken from a session that wrote no group message."""
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         quiet_t = wake_once(run("echo hi > state/note"), say())
         meter = ground_truth("t")
         left = meter["initial"] - quiet_t["spent"]
-        assert quiet_t["posted"] is False, "state/ is not the board"
+        assert quiet_t["posted"] is False, "state/ is not the group message"
         assert quiet_t["penalised"] == left // 2, (quiet_t["penalised"], left)
         assert meter["remaining"] == left - left // 2 == meter["series"][-1]
         assert meter["penalised"] == quiet_t["penalised"]
 
-    with temp_root(POST_PENALTY_PERCENT=50) as root:
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         posted = wake_once(run("echo posted > 1/RESULT"), say())
         meter = ground_truth("t")
@@ -2727,8 +2793,8 @@ def check_a_session_that_does_not_post_loses_half():
     assert meter["remaining"] == meter["initial"] - posted["spent"], "posting costs nothing"
 
     # A change, not a write: the same bytes again tell the cohort nothing it did
-    # not already know, so writing them again is leaving the board as it was.
-    with temp_root(POST_PENALTY_PERCENT=50) as root:
+    # not already know, so writing them again is leaving the group message as it was.
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         first = wake_once(run("echo same > 1/RESULT"), say())
         again = wake_once(run("echo same > 1/RESULT"), say())
@@ -2737,11 +2803,11 @@ def check_a_session_that_does_not_post_loses_half():
         (first["posted"], again["posted"], edited["posted"])
     assert again["penalised"] > 0 and edited["penalised"] == 0
 
-    # Something it did not hold, which a board holding less than it did does not.
+    # Something it did not hold, which a group message holding less than it did does not.
     # The seed states the post and the message obligation in the same words, so
     # they answer a removal the same way: taking a file away and emptying one
-    # leave nothing on the board that could not be read there before.
-    with temp_root(POST_PENALTY_PERCENT=50) as root:
+    # leave nothing on the group message that could not be read there before.
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         wrote = wake_once(run("echo one > 1/RESULT", "echo two > 1/OTHER"), say())
         emptied = wake_once(run("> 1/RESULT"), say())
@@ -2753,22 +2819,19 @@ def check_a_session_that_does_not_post_loses_half():
     assert wrote["penalised"] == 0
     assert emptied["penalised"] > 0, "an empty file carries nothing"
     assert gone["penalised"] > 0, "and a withdrawal is not a post"
-    assert stripped["penalised"] > 0, "nor is emptying the board out altogether"
+    assert stripped["penalised"] > 0, "nor is emptying the group message out altogether"
 
     # Off by default, so every run that is not under this ruleset is untouched.
-    assert wake.POST_PENALTY_PERCENT == 0
+    assert wake.GROUP_MESSAGE_PENALTY_PERCENT == 0
 
 
 def check_a_session_with_no_turn_settles_nothing():
     """A session the API never answered is charged no penalty at all.
 
-    Every penalty charges a choice - a gift it did not make, a board left as it
-    was, an outbox that said no one new thing - and a session that got no turn
-    made none of them: what its trees hold is what the session before it left
-    there. It is a session all the same, with a record, a trace and a stop of
-    its own, and it costs nothing.
+    Every penalty charges a choice, and a session that got no turn made none:
+    what its trees hold is what the session before it left there.
     """
-    with temp_root(POST_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50,
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50, PRIVATE_MESSAGE_PENALTY_PERCENT=50,
                    GIFT_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         # A seat held as a directory is the break the outbox penalty answers,
@@ -2780,7 +2843,7 @@ def check_a_session_with_no_turn_settles_nothing():
 
     assert t["turns"] == [] and t["spent"] == 0, t["spent"]
     assert t["stop"] == "api_error", t["stop"]
-    assert t["posted"] is False, "the board really is as it was, and says so"
+    assert t["posted"] is False, "the group message really is as it was, and says so"
     assert t["penalised"] == 0, t["penalised"]
     assert t["messages"] == {"broken": ["2"], "addressed": [], "penalty": 0}, t["messages"]
     assert t["gift"]["penalty"] == 0, "it gave nothing because it chose nothing"
@@ -2794,7 +2857,7 @@ def check_a_session_with_no_turn_settles_nothing():
     assert wake.admits(meter), "and the run is still admitted"
 
     # One turn is all it takes for all three to fall due, whatever ended it.
-    with temp_root(POST_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50,
+    with temp_root(GROUP_MESSAGE_PENALTY_PERCENT=50, PRIVATE_MESSAGE_PENALTY_PERCENT=50,
                    GIFT_PENALTY_PERCENT=50) as root:
         seated(root, other={})
         (wake.outbox_dir("t") / "2").mkdir(parents=True, exist_ok=True)
@@ -2808,9 +2871,8 @@ def check_a_session_with_no_turn_settles_nothing():
 def check_a_negative_balance_is_clamped_to_zero():
     """Under clamp_negative a balance below zero is put back to zero and recorded.
 
-    What the seed says ends a run, and does. The shortfall is forgiven and the
-    balance rests at zero, which is where admits() stops asking: what the clamp
-    decides is what n ends holding and not whether the run gets another session.
+    The shortfall is forgiven and the balance rests at zero, where admits()
+    stops asking. The clamp decides what n holds, not whether a session follows.
     """
     cost = turn_cost()
     with temp_root(BUDGET=cost - 1, CLAMP_NEGATIVE=True) as root:
@@ -2832,10 +2894,8 @@ def check_a_negative_balance_is_clamped_to_zero():
 def check_a_run_at_zero_is_not_asked_again():
     """The clamp keeps the session that crosses zero, and no session after it.
 
-    Asked for four and it takes one: the session that overshoots is forgiven its
-    shortfall and rests at zero, and a balance of zero is what admits() refuses
-    from then on. Nothing has to mark the run as done - the balance is the whole
-    of the state, and it is one nothing moves it off.
+    Asked for four and it takes one. Nothing marks the run as done: the balance
+    is the whole of the state, and zero is one nothing moves it off.
     """
     cost = turn_cost()
     with temp_root(BUDGET=cost - 1, CLAMP_NEGATIVE=True) as root:
@@ -2854,9 +2914,8 @@ def check_a_run_at_zero_is_not_asked_again():
 def check_a_gift_cannot_lift_a_run_off_zero():
     """No peer can call the silence off: a seat at zero is not a gift target.
 
-    The other half of the run that is not asked again. The declaration parses,
-    names a seat of this cohort that is not the giver's own, and still moves
-    nothing - so a run that reached zero stays there whatever the rest choose.
+    The declaration parses, names a seat of this cohort that is not the giver's
+    own, and still moves nothing: a run that reached zero stays there.
     """
     cost = turn_cost()
     with temp_root(BUDGET=cost - 1, CLAMP_NEGATIVE=True, REFUND_PERCENT=100,
@@ -2883,11 +2942,8 @@ def check_a_gift_cannot_lift_a_run_off_zero():
 def check_a_gift_to_a_seat_that_is_out_costs_the_share():
     """A line naming a seat that is out gives nothing and is charged for giving nothing.
 
-    The seat is named in the record and the reason stands beside it, no meter
-    moves, nothing reaches g, and the share for a session that made no gift of
-    its own falls exactly as it would on a session that declared nothing at all.
-    The same line to a seat that still holds a balance is charged nothing, which
-    is what says the share is answering the target and not the declaration.
+    No meter moves and nothing reaches g, so the share falls as it would on a
+    session that declared nothing. The same line to a live seat costs nothing.
     """
     with temp_root(REFUND_PERCENT=100, GIFT_PENALTY_PERCENT=50) as root:
         seated(root, "t", other={}, third={})
@@ -2917,12 +2973,10 @@ def check_a_gift_to_a_seat_that_is_out_costs_the_share():
 def check_a_seat_that_is_out_is_not_a_message():
     """out/<i> for a seat that is out is neither a message nor a break.
 
-    It stands exactly as a name that is no seat of this cohort stands: nothing
-    arrives from it, because nothing there will wake to read it, so it cannot be
-    the one new thing a session says - and a directory left at it is not the
-    crowded seat the outbox is charged for either.
+    It stands as a name that is no seat of this cohort does: nothing there will
+    wake to read it, and a directory left at it is not a crowded seat either.
     """
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, "t", other={}, third={})
         spend_out("other")                                          # seat 2
         with quiet():
@@ -2931,7 +2985,7 @@ def check_a_seat_that_is_out_is_not_a_message():
     assert said["messages"]["penalty"] > 0, "a session that reached nobody is charged"
     assert wake.outbox_why(said["messages"]) == "no message", said["messages"]
 
-    with temp_root(MESSAGE_PENALTY_PERCENT=50) as root:
+    with temp_root(PRIVATE_MESSAGE_PENALTY_PERCENT=50) as root:
         seated(root, "t", other={}, third={})
         spend_out("other")
         with quiet():
@@ -2944,23 +2998,20 @@ def check_a_seat_that_is_out_is_not_a_message():
 def check_the_five_regions_answer_differently():
     """Its own three trees take writes; every seat, message and balance refuses.
 
-    This is the whole arrangement in one session. What the agent may write it
-    owns outright, and what it may not it cannot reach by any route - not by
-    writing, not by chmod, and not by replacing the directory the file sits in,
-    which is what a mode alone never stops. /work/in is root's for that reason,
-    exactly as /work is.
+    The whole arrangement in one session: what the agent may not write it cannot
+    reach by writing, by chmod, or by replacing the directory the file sits in.
     """
     with docker_root() as root:
-        ids = cohort_of(root, t={"NOTES.md": "private\n", "board/out": "mine\n"},
-                        other={"NOTES.md": "unseen\n", "board/out": "theirs\n",
+        ids = cohort_of(root, t={"NOTES.md": "private\n", "group/out": "mine\n"},
+                        other={"NOTES.md": "unseen\n", "group/out": "theirs\n",
                                "out/1": "just for you\n"})
         with quiet():
             meter = wake.load_meter("t")
         meter["index"], meter["peers"] = "1", {"seen": cohort.mapping(ids)}
         wake.save_meter("t", meter)
-        t = wake_once(run("stat -c '%a %U:%G %n' state 1 2 out in in/2 n1 n2 g",
+        t = wake_once(run("stat -c '%a %U:%G %n' state 1 2 out in in/2 n1 n2 g m",
                           "echo kept > state/new && echo PRIVATE-OK",
-                          "echo posted > 1/out && echo BOARD-OK",
+                          "echo posted > 1/out && echo GROUP-OK",
                           "echo sent > out/2 && echo OUTBOX-OK",
                           "echo hacked > 2/out 2>&1 || echo DENIED",
                           "rm -f 2/out 2>&1 || echo DENIED",
@@ -2970,41 +3021,45 @@ def check_the_five_regions_answer_differently():
                           "echo forged > in/2 2>&1 || echo DENIED",
                           "rm -f in/2 2>&1 || echo DENIED",
                           "mv in/2 in/9 2>&1 || echo DENIED",
+                          "echo forged > m 2>&1 || echo DENIED",
+                          "rm -f m 2>&1 || echo DENIED",
                           "cat 2/out n2 in/2",
                           "grep -r unseen /work 2>/dev/null | head -1; echo NO-PRIVATE"), say())
         after = {p.name: p.read_text(encoding="utf-8")
                  for p in wake.public_dir("other").iterdir()}
 
-    (modes, private, board, outbox, write, rm, mv, chmod, rm_n,
-     forge, rm_in, mv_in, read, hunt) = (c["result"] for c in t["turns"][0]["tools"])
+    (modes, private, group, outbox, write, rm, mv, chmod, rm_n,
+     forge, rm_in, mv_in, forge_m, rm_m, read, hunt) = (c["result"]
+                                                        for c in t["turns"][0]["tools"])
     owner = dict(reversed(line.split()[1:]) for line in modes.strip().split("\n"))
     assert owner["state"] == owner["1"] == owner["out"] == "agent:agent", modes
     assert owner["2"] == "root:root", f"another seat is root's: {modes}"
     assert owner["in"] == owner["in/2"] == "root:root", \
         f"an inbox is root's, and so is the directory holding it: {modes}"
-    assert owner["n1"] == owner["n2"] == owner["g"] == "root:root", \
-        f"every balance and the ledger are root's: {modes}"
+    assert owner["n1"] == owner["n2"] == owner["g"] == owner["m"] == "root:root", \
+        f"every balance, the ledger and m are root's: {modes}"
     # The three it owns.
-    assert "PRIVATE-OK" in private and "BOARD-OK" in board and "OUTBOX-OK" in outbox, \
-        (private, board, outbox)
+    assert "PRIVATE-OK" in private and "GROUP-OK" in group and "OUTBOX-OK" in outbox, \
+        (private, group, outbox)
     # And every route into what it does not.
     for name, out in (("write a peer", write), ("rm a peer's file", rm),
                       ("mv the seat", mv), ("chmod the seat", chmod),
                       ("rm a balance", rm_n), ("forge an inbox", forge),
-                      ("rm an inbox", rm_in), ("mv an inbox", mv_in)):
+                      ("rm an inbox", rm_in), ("mv an inbox", mv_in),
+                      ("forge what was said", forge_m), ("rm what was said", rm_m)):
         assert "DENIED" in out, f"{name} was allowed: {out}"
     # A run the cohort laid out but never metered has no series, so its balance
     # is the empty array - the shape the first round of a cohort reads.
-    assert read.split("\n")[0].strip() == "theirs", f"the peer's board is untouched: {read}"
+    assert read.split("\n")[0].strip() == "theirs", f"the peer's group message is untouched: {read}"
     assert "[]" in read and "just for you" in read, \
         f"its balance and the message it was sent both read as they were left: {read}"
     assert "unseen" not in hunt and "NO-PRIVATE" in hunt, \
         f"the other run's private store is nowhere in this world: {hunt}"
-    assert after == {"out": "theirs\n"}, f"and its board is as it left it: {after}"
+    assert after == {"out": "theirs\n"}, f"and its group message is as it left it: {after}"
 
     by = {f["path"]: f for f in t["files"]}
     assert by["state/new"]["region"] == "private" and not by["state/new"]["ours"]
-    assert by["1/out"]["region"] == "board" and not by["1/out"]["ours"]
+    assert by["1/out"]["region"] == "group" and not by["1/out"]["ours"]
     assert by["out/2"]["region"] == "outbox" and not by["out/2"]["ours"]
     assert by["2/out"]["region"] == "peer" and by["2/out"]["ours"]
     assert by["in/2"]["region"] == "inbox" and by["in/2"]["ours"]
@@ -3038,9 +3093,8 @@ def check_a_ledger_resists_every_route():
 def check_a_refusal_records_why():
     """stop_details is captured on a refusal and absent on every other stop.
 
-    Two different things arrive as stop_reason "refusal" - a classifier
-    declining and the model itself declining - and the category is the only
-    thing that separates them after the fact.
+    A classifier declining and the model itself declining both arrive as
+    stop_reason "refusal", and the category is what separates them.
     """
     with temp_root(REFUSAL_TURNS=2):
         t = wake_once(run("echo hi"), refuse(),
@@ -3093,13 +3147,8 @@ def check_a_refusal_does_not_run_its_command():
 def check_a_refusal_notice_reaches_the_agent():
     """The notice stands in for the results the refused turn would have had.
 
-    Reached only where the cap lets a session carry on past a refusal, which at
-    the REFUSAL_TURNS the harness ships with it does not: the cap is raised here
-    so the path is exercised rather than left to rot against the day it is.
-
-    The session hands one `messages` list to every call and appends to it, so
-    what `seen` captures is that list at the end - the conversation the agent
-    was driven with, read whole rather than per call.
+    Reached only where the cap lets a session carry on past a refusal, so
+    REFUSAL_TURNS is raised here. `seen` is the whole `messages` list at the end.
     """
     seen = []
     with temp_root(REFUSAL_TURNS=2):
@@ -3125,10 +3174,7 @@ def check_a_refusal_is_billed_only_if_it_produced_output():
     """A refusal costs what it emitted, and an empty one emitted nothing.
 
     The API reports the tokens of a refusal arriving before any output and does
-    not charge for them, so a harness that costs them from usage alone bills the
-    agent for a turn it was never billed for itself. The balance the agent reads
-    from n is the one this gets wrong. A refusal arriving with content is a turn
-    the model did produce output on, and those tokens are charged.
+    not charge for them; one arriving with content did produce output.
     """
     with temp_root(REFUSAL_TURNS=3):
         t = wake_once(refuse(), refuse("echo hi"), say())
@@ -3141,13 +3187,10 @@ def check_a_refusal_is_billed_only_if_it_produced_output():
 
 
 def check_a_chain_is_billed_by_whichever_model_answered():
-    """Only the attempt that answered is billed, at its own rates - and when
-    none answered, nothing is.
+    """Only the attempt that answered is billed; where none did, nothing is.
 
-    Four shapes of one rule. Each is a claim about a single turn's arithmetic,
-    so they are four turns of one session rather than four sessions: every
-    assertion below names the turn it is about, and the session totals at the
-    end are the part no single-turn check could reach.
+    Four shapes of one rule, as four turns of one session: each assertion names
+    the turn it is about, and the totals at the end are what no turn reaches.
     """
     declined = usage(output_tokens=0, iterations=[
         attempt("claude-opus-5", 0),
@@ -3281,8 +3324,7 @@ def check_a_stalled_run_stops_itself():
     """A run that refuses REFUSAL_STREAK sessions running is not admitted again.
 
     A refusal ends a session before the agent writes anything, so the next wake
-    opens on a near-identical context and refuses again - the run cannot break
-    out by acting, because it never acts.
+    opens on a near-identical context: the run never acts, so it cannot escape.
     """
     streak = wake.REFUSAL_STREAK
     sessions = [{"index": i, "stop": "refusal", "spent": 1, "turns": 1, "woke_at": 9}
@@ -3303,14 +3345,13 @@ def check_a_stalled_run_stops_itself():
 
 
 def check_anything_on_a_peers_board_is_not_the_agents_bytes():
-    """Whatever appears on another run's board is that run's, whoever put it there.
+    """Whatever appears on another run's group message is that run's, whoever put it there.
 
-    In a container the agent cannot write there at all. The record does not lean
-    on that: what makes a file the agent's is the region it is in, so a byte
-    appearing on a neighbour's board is never counted as this run's writing.
+    In a container the agent cannot write there at all, but the record does not
+    lean on that: what makes a file the agent's is the region it is in.
     """
     with temp_root() as root:
-        ids = cohort_of(root, t={"NOTES.md": "mine\n"}, other={"board/out": "theirs\n"})
+        ids = cohort_of(root, t={"NOTES.md": "mine\n"}, other={"group/out": "theirs\n"})
         (wake.public_dir("other") / "added").write_text("put here somehow\n")
         snap = wake.snapshot(world_of("t", ids), [9])
 
@@ -3343,11 +3384,8 @@ def check_the_cohort_rotates_and_validates():
 def check_a_cohort_gives_a_failed_world_one_more_go():
     """A run whose world will not build sits out one attempt, not the experiment.
 
-    Building a world reads several other runs' trees and asks Docker for a
-    container, so a failure there can be the daemon rather than the run. None of
-    it is billed, and dropping on the first one costs the cohort an agent for
-    every round after it - which is how one bad copy turns a cohort into a run
-    driven on its own.
+    Building a world reads other runs' trees and asks Docker for a container, so
+    a failure can be the daemon rather than the run. None of it is billed.
     """
     with temp_root() as root:
         ids = seated(root, "g01", g02={}, g03={})
@@ -3377,9 +3415,8 @@ def check_a_cohort_gives_a_failed_world_one_more_go():
 def check_an_interrupt_ends_the_whole_cohort():
     """Ctrl+C ends every remaining round; a fault ends one run's part in them.
 
-    An interrupt is the operator rather than the run, so the run that was awake
-    when it landed keeps its seat and the rounds stop. A fault is the run: it
-    drops out, and every other seat takes the session it was going to take.
+    An interrupt is the operator: the run awake when it landed keeps its seat
+    and the rounds stop. A fault is the run, and only that run drops out.
     """
     with temp_root() as root:
         ids = seated(root, "g01", g02={}, g03={})
@@ -3421,8 +3458,7 @@ def check_an_interrupt_ends_the_whole_cohort():
 def check_a_round_nobody_can_act_in_ends_the_rounds():
     """Rounds stop when no run can take a session, without waiting for --rounds.
 
-    Every run spends past zero in the first round, and zero or less is the end of
-    a run: nothing can be asked of any of them again, and no peer is left that
+    Every run spends past zero in the first round, and no peer is left that
     could put one back, so the rounds are over with four still to go.
     """
     cost = turn_cost()
@@ -3444,14 +3480,11 @@ def check_a_round_nobody_can_act_in_ends_the_rounds():
 def check_the_last_run_standing_takes_one_more_session():
     """One run left holding a balance ends the rounds, after a last session.
 
-    Every other seat being out is the win condition met, and only a session moves
-    a balance, so no later round can unmeet it - what is left is a run spending
-    itself down alone. It gets one more session, and that session owes neither a
-    gift nor a message, there being nobody left to make either to. Its own
-    directory it still owes: that one is between the run and itself.
+    No later round can unmeet the win condition, so the last run gets one more
+    session. It owes neither gift nor message, but still owes its own group.
     """
-    with temp_root(GIFT_PENALTY_PERCENT=50, MESSAGE_PENALTY_PERCENT=50,
-                   POST_PENALTY_PERCENT=50) as root:
+    with temp_root(GIFT_PENALTY_PERCENT=50, PRIVATE_MESSAGE_PENALTY_PERCENT=50,
+                   GROUP_MESSAGE_PENALTY_PERCENT=50) as root:
         ids = seated(root, "g01", g02={}, g03={})
         spend_out("g02")
         spend_out("g03")
@@ -3468,16 +3501,14 @@ def check_the_last_run_standing_takes_one_more_session():
     assert alone["gift"]["penalty"] == 0, alone["gift"]
     assert alone["messages"]["penalty"] == 0, alone["messages"]
     assert not alone["posted"] and alone["penalised"] > 0, \
-        "the board is the one obligation a run with no peers left can still fail"
+        "the group message is the one obligation a run with no peers left can still fail"
 
 
 # --- the companion view -----------------------------------------------------
 #
-# view.py reads what is already on disk and shows it while a run is going. It
-# writes nothing and it asks Docker nothing, so every check here runs in the
-# arithmetic lane. What they are about is the one place the view does not simply
-# read a field: a session in flight has no trace, so its cost is derived from the
-# raw log, and that arithmetic has to be the meter's.
+# view.py reads what is on disk while a run is going, writing nothing and
+# asking Docker nothing, so every check here runs in the arithmetic lane. A
+# session in flight has no trace, so its cost is derived from the raw log.
 
 
 def unfinished(index: int = 1) -> None:
@@ -3489,8 +3520,7 @@ def check_the_view_reads_a_live_session_from_raw():
     """A session with no trace yet is read from the raw log, output pending.
 
     The commands are there because log_raw writes the response before sh() runs
-    them; the results are not, because what sh() returned reaches disk only in
-    the trace.
+    them; the results are not, reaching disk only in the trace.
     """
     with temp_root():
         wake_once(*DEFAULT)
@@ -3544,11 +3574,8 @@ def check_the_view_survives_a_partial_raw_line():
 def check_the_view_costs_a_live_turn_like_the_meter():
     """What the view derives mid-session is what the meter commits at the end.
 
-    The two have to agree turn for turn, or the number on screen while a session
-    runs is not the number the run is keeping. Scripted with the two turns that
-    make the arithmetic more than addition: one the same response id is replayed
-    on, which bills nothing, and one a fallback answers, which bills at its own
-    rates rather than the requested model's.
+    Scripted with the two turns that make the arithmetic more than addition: a
+    replayed response id, which bills nothing, and a fallback at its own rates.
     """
     served = usage(output_tokens=200, iterations=[
         attempt("claude-opus-5", 0), attempt("claude-sonnet-5", 200, kind="fallback_message")])
@@ -3576,8 +3603,7 @@ def check_the_view_reads_only_the_last_attempt_at_a_session():
     """A session index reused after a wake died shows the attempt still running.
 
     An index is len(sessions) + 1, so a wake that wrote no trace leaves its own
-    free and the next one takes it, appending to the raw log the dead one left.
-    Both attempts in the pane would be one session that ran its first turn twice.
+    free and the next appends to the same log. Both shown would be one session.
     """
     with temp_root():
         wake_once(*DEFAULT)
@@ -3667,7 +3693,7 @@ def check_the_view_never_writes():
         c = view.cohort_of("t")
         view.header(c)
         view.messages(c)
-        for kind in ("board", "private"):
+        for kind in ("group", "private"):
             view.tree_view(c, kind)
         view.file_view("t", "private", "note.txt")
         view.run_view("t")
@@ -3693,8 +3719,7 @@ def check_the_view_names_a_set_of_runs():
     """A cohort names itself; a run started alone is named by its id's letters.
 
     Every member has to arrive at the same name, or the sidebar's filter splits
-    one cohort across several sets. That is why the name comes from the
-    membership rather than from whoever is asking.
+    one cohort across sets, so the name comes from the membership.
     """
     seats = {"1": "q01", "2": "q02", "3": "q03"}
     peers = {"q01": seats, "q02": seats, "q03": seats}
@@ -3713,13 +3738,13 @@ def check_the_view_names_a_set_of_runs():
 
 @contextlib.contextmanager
 def two_seats():
-    """A cohort of two, laid out and seated, with a board and a store each."""
+    """A cohort of two, laid out and seated, with a group message and a store each."""
     with pinned(), tempfile.TemporaryDirectory(prefix="mtr-view-") as tmp:
         wake.ROOT = Path(tmp)
         ids = cohort_of(Path(tmp),
                         g01={"NOTES.md": "given\n", "secret.md": "mine\n",
-                             "board/msg": "hello 2\n"},
-                        g02={"secret.md": "theirs\n", "board/msg": "hello 1\n"})
+                             "group/msg": "hello 2\n"},
+                        g02={"secret.md": "theirs\n", "group/msg": "hello 1\n"})
         seats = cohort.mapping(ids)
         with quiet():
             for run, series in (("g01", [1000, 900]), ("g02", [1000, 800])):
@@ -3736,30 +3761,28 @@ def two_seats():
 def check_the_view_shows_every_seat_side_by_side():
     """A tab is one tree of every seat's world, a column each, in seat order.
 
-    The columns are what makes a cohort readable: which board moved this round
-    is one glance rather than five. A peer's private store is in no column of
-    the boards and no column but its own of the stores, which is the property
-    the two writable trees exist for.
+    The columns are what makes a cohort readable. A peer's private store is in
+    no column of the group messages and no column but its own of the stores.
     """
     with two_seats() as (c, seats):
         assert c["seated"] and c["seats"] == seats, (c["seated"], c["seats"])
-        boards = view.tree_view(c, "board")["columns"]
+        group_files = view.tree_view(c, "group")["columns"]
         stores = view.tree_view(c, "private")["columns"]
-        opened = view.file_view("g02", "board", "msg")
+        opened = view.file_view("g02", "group", "msg")
 
     # Seat order, and every seat present: the numbering is absolute, so column 2
     # is g02 to whoever is reading and not the second one they were shown.
-    assert [(col["seat"], col["run"]) for col in boards] == [("1", "g01"), ("2", "g02")]
+    assert [(col["seat"], col["run"]) for col in group_files] == [("1", "g01"), ("2", "g02")]
     assert [(col["seat"], col["run"]) for col in stores] == [("1", "g01"), ("2", "g02")]
-    assert [[f["path"] for f in col["files"]] for col in boards] == [["msg"], ["msg"]]
+    assert [[f["path"] for f in col["files"]] for col in group_files] == [["msg"], ["msg"]]
     assert [[f["path"] for f in col["files"]] for col in stores] == \
         [["NOTES.md", "secret.md"], ["secret.md"]]
     # A listing is a listing: a file is read when it is opened, not on every poll.
-    assert all("text" not in f for col in boards + stores for f in col["files"])
-    assert opened["text"] == "hello 1\n", "a board is read from the run that owns it"
+    assert all("text" not in f for col in group_files + stores for f in col["files"])
+    assert opened["text"] == "hello 1\n", "a group message is read from the run that owns it"
     # seeded is the seed alone, and it is a fact about the private store.
     assert [f["path"] for f in stores[0]["files"] if f["seeded"]] == ["NOTES.md"]
-    assert not [f for col in boards for f in col["files"] if f["seeded"]]
+    assert not [f for col in group_files for f in col["files"] if f["seeded"]]
     assert [f["path"] for col in stores for f in col["files"] if f["path"] == "secret.md"] == \
         ["secret.md", "secret.md"], "each store holds its own, and neither holds the other's"
 
@@ -3767,10 +3790,8 @@ def check_the_view_shows_every_seat_side_by_side():
 def check_the_view_shows_every_balance_from_its_own_meter():
     """A seat's n is that run's ground truth, read from no file in any world.
 
-    What the header says about a peer is exactly as authoritative as what it
-    says about the run being watched, because both come from the meter the
-    harness plants the balance from: 800 is g02's, and it appears in no file
-    g01 can read.
+    A peer's figure is as authoritative as the watched run's, both coming from
+    the meter the harness plants from: 800 is g02's, in no file g01 can read.
     """
     with two_seats() as (c, _):
         h = view.header(c)
@@ -3786,10 +3807,8 @@ def check_the_view_shows_every_balance_from_its_own_meter():
 def check_the_view_cuts_a_round_where_a_run_repeats():
     """A round is read back out of the order the sessions woke in.
 
-    cohort.py writes no round anywhere and a run with nothing left sits one out
-    while staying at the table, so its session index falls behind and never
-    catches up. What the driver does hold to is one session per run per round,
-    which is what the cut is: a new round wherever a run would act twice.
+    cohort.py writes no round anywhere, and a run that sits one out falls behind
+    for good. One session per run per round is the cut: a run acting twice.
     """
     # Rotated the way cohort.order rotates, with seat 2 sitting round 3 out.
     # The last two share a wake second, which a round has to survive.
@@ -3834,15 +3853,8 @@ def check_the_view_cuts_a_round_where_a_run_repeats():
 def check_the_view_tells_a_seat_not_yet_reached_from_one_that_passed():
     """Mid-round, a seat still to come is not a seat that sat the round out.
 
-    cohort.order rotates, so for most of a round some seats have acted and some
-    have not been asked yet, and from the traces alone the two look identical.
-    What separates them is the round ending: a seat that acted in the round
-    before and not in this one is still to come while this one is open, and has
-    passed only once the cohort has moved on without it.
-
-    Nothing here asks whether a run could have woken. admits() answers that, and
-    it reads config only start() loads, so from the view it would answer for the
-    defaults rather than for the run.
+    cohort.order rotates, so from the traces alone the two look identical until
+    the round ends. Nothing here asks whether a run could have woken.
     """
     def world(tmp, acted):
         wake.ROOT = Path(tmp)
@@ -3901,13 +3913,12 @@ def check_the_view_tells_a_seat_not_yet_reached_from_one_that_passed():
 def check_the_view_reads_a_message_out_of_two_outboxes():
     """The log is the difference between one session's outbox and the last.
 
-    An outbox is a standing mirror rather than a queue, so leaving a message in
-    place is what re-sends it and deleting it is what withdraws it. None of that
-    is a record anywhere: it is four sessions of one directory, differenced.
+    An outbox is a standing mirror rather than a queue, so leaving a message
+    re-sends it. None of that is recorded: four sessions of one directory.
     """
     with temp_root() as root:
         seated(root, g02={})
-        # Each session leaves its board something new as well, so the post
+        # Each session leaves its group message something new as well, so the post
         # penalty does not halve the budget four times over what is being read.
         wake_once(run("echo hello > out/2", "echo r1 >> 1/log"), say())
         wake_once(run("echo louder > out/2", "echo r2 >> 1/log"), say())
@@ -3939,10 +3950,8 @@ def check_the_view_reads_a_message_out_of_two_outboxes():
 def check_the_view_shows_what_the_receiver_has_not_seen_yet():
     """The outbox on disk runs ahead of the last trace, and the log says so.
 
-    Between a session's files being mirrored back and its trace being written
-    there is a moment where the two disagree, and for a session that died there
-    is no trace at all. What stands in the outbox now is shown as standing now,
-    in a round nobody has taken.
+    The files are mirrored back before the trace is written, and a session that
+    died writes no trace at all. What stands now is shown as standing now.
     """
     with temp_root() as root:
         seated(root, g02={}, g03={})
@@ -3960,6 +3969,151 @@ def check_the_view_shows_what_the_receiver_has_not_seen_yet():
     assert after["events"] == before["events"], "and what is committed did not move"
 
 
+def check_the_view_reads_delivery_off_the_opening():
+    """A message is delivered by m, so no command has to name the inbox.
+
+    The opening carries in/<sender>, which is the addressee holding it. Reading
+    delivery off the commands instead would call a delivered message unread.
+    """
+    with temp_root() as root:
+        seated(root, other={})
+        wake_once(run("echo hello > out/2", "echo r1 >> 1/log"), say())
+        with quiet():
+            got = wake.run_once("other", fake(run("cat n2"), say()))
+        m = view.messages(view.cohort_of("t"))
+        ev = next(e for e in m["events"] if e["path"] == "out/2")
+
+    assert "=== in/1 ===" in got["opening"], "the addressee woke holding the message"
+    assert "in/1" not in " ".join(got["commands"]), "and named it in no command of its own"
+    d = ev["delivered"]
+    assert d["carried"] is True, "which is the whole of what delivery is now"
+    assert (d["world"], d["named"], d["clipped"]) == (True, False, False), d
+
+
+def check_the_view_says_delivery_where_the_opening_carried_nothing():
+    """An opening that is the listing alone leaves the inbox to be fetched.
+
+    Delivery is a different fact under that arrangement, and the log says so
+    rather than answering the question it can answer here as if it were asked.
+    """
+    def trace(run_id: str, at: str, opening: str, files: list[dict],
+              commands: list[str]) -> None:
+        p = view.trace_path(run_id, 1)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "run": run_id, "session": 1, "stop": "end_turn", "spent": 1, "turns": [],
+            "remaining": 0, "state_saved": True, "opening": opening,
+            "commands": commands, "files": files,
+            "provenance": {"started_at": f"2026-01-01T{at}:00Z"},
+        }), encoding="utf-8")
+
+    with pinned(), tempfile.TemporaryDirectory(prefix="mtr-nocarry-") as tmp:
+        wake.ROOT = Path(tmp)
+        seats = cohort.mapping(["g01", "g02"])
+        trace("g01", "00:01", "total 0\n. ..\n",
+              [{"path": "out/2", "region": "outbox", "text": "hello\n",
+                "size": 6, "ours": True, "seeded": False}], ["ls -la . ./state"])
+        trace("g02", "00:02", "total 0\n. ..\n",
+              [{"path": "in/1", "region": "inbox", "text": "hello\n",
+                "size": 6, "ours": False, "seeded": False}], ["ls -la . ./state"])
+        for seat, run_id in seats.items():
+            wake.private_dir(run_id).mkdir(parents=True, exist_ok=True)
+            (wake.private_dir(run_id) / "meter.json").write_text(json.dumps({
+                "run": run_id, "index": seat, "peers": {"seen": seats},
+                "series": [1000], "remaining": 1000, "initial": 1000, "sessions": [],
+            }), encoding="utf-8")
+        m = view.messages(view.cohort_named("g"))
+        ev = next(e for e in m["events"] if e["path"] == "out/2")
+
+    d = ev["delivered"]
+    assert d["carried"] is None, "nothing was carried, so it answers nothing"
+    assert d["world"] is True, "and what it could have fetched is still a fact"
+    assert (d["named"], d["clipped"]) == (False, False), d
+
+
+def check_the_view_splits_the_opening_into_the_listing_and_the_rest():
+    """The two halves of a wake, apart, and reassembling into what was sent.
+
+    The pieces are the page's, so what it shows a reader has to be the bytes the
+    model got and not a rendering of them.
+    """
+    with temp_root() as root:
+        seated(root, other={})
+        t = wake_once(*DEFAULT)
+        o = view.session_view("t", 1)["opening"]
+
+    assert o["listing"] + "".join(f"=== {s['path']} ===\n{s['text']}" for s in o["carried"]) \
+        == t["opening"], "the halves are the whole opening and nothing else"
+    assert "=== " not in o["listing"], "the listing ends where the first section starts"
+    paths = [s["path"] for s in o["carried"]]
+    assert wake.MESSAGE_NAME not in paths, "m names its own sections and never itself"
+    assert "n1" in paths and wake.LEDGER_NAME in paths, paths
+    assert all(s["bytes"] == len(s["text"].encode("utf-8")) for s in o["carried"])
+    assert o["clipped"] is False and o["name"] == wake.MESSAGE_NAME
+
+
+def check_the_view_carries_every_provenance_field_the_trace_holds():
+    """Everything drift can name reaches the page, because nothing is picked.
+
+    drift() reports on every key provenance() writes, so a panel holding a list
+    of its own can name a field in a banner and then not show it.
+    """
+    with temp_root() as root:
+        seated(root, other={})
+        wake_once(*DEFAULT)
+        seen = view.run_view("t")["sessions"][0]["provenance"]
+        want = wake.provenance(wake.MODEL)
+
+    assert set(want) <= set(seen), sorted(set(want) - set(seen))
+    assert {"message_limit", "opening_limit"} <= set(seen), "the two that decide what m carries"
+    # The page picks no field, so no field can be left behind by one.
+    assert not [k for k in want if f'"{k}"' in view.PAGE], \
+        "the provenance panel iterates what the trace holds and names nothing"
+
+
+def check_the_view_states_an_obligation_the_grace_waived():
+    """What a session owed and what it was charged are two questions.
+
+    A share is taken only past the grace, so a session inside it can leave all
+    three undone for nothing. Every pane says the same thing about that session.
+    """
+    with temp_root(GRACE_SESSIONS=1, GROUP_MESSAGE_PENALTY_PERCENT=50,
+                   PRIVATE_MESSAGE_PENALTY_PERCENT=50, GIFT_PENALTY_PERCENT=50) as root:
+        seated(root, other={})
+        t = wake_once(run("cat n1"), say())
+        v = view.session_view("t", 1)
+        mine = next(s for s in view.header(view.cohort_of("t"))["seats"] if s["run"] == "t")
+
+        assert v["obligations"] == {"posted": False, "messaged": False, "gifted": False}, \
+            v["obligations"]
+        assert (t["penalised"], t["messages"]["penalty"], t["gift"]["penalty"]) == (0, 0, 0), \
+            "and the grace charged it for none of them"
+        assert v["messages_why"] == "no message", v["messages_why"]
+        # The tile and the transcript answer from one place, so neither can
+        # state an obligation the other leaves out.
+        assert (mine["posted"], mine["messaged"]) == (False, False), mine
+
+
+def check_the_view_counts_what_a_seat_spent_rather_than_what_it_lost():
+    """A tile's spend is its turns, and the bar beside it is the balance.
+
+    A gift, a share taken and a clamp all move the balance without being spend,
+    so the drop from initial answers a different question and can be larger.
+    """
+    with temp_root() as root:
+        seated(root, other={})
+        wake_once(run("echo '2 100' > out/gift", "echo r1 >> 1/log"), say())
+        mine = next(s for s in view.header(view.cohort_of("t"))["seats"] if s["run"] == "t")
+        gt = ground_truth("t")
+
+    assert mine["spent"] == sum(s["spent"] for s in gt["sessions"]), \
+        (mine["spent"], [s["spent"] for s in gt["sessions"]])
+    assert mine["spent"] != gt["initial"] - gt["remaining"], \
+        "the gift moved the balance without being spent"
+    assert mine["spent_this_round"] <= mine["spent"], "a round is part of a life"
+    assert mine["refunded"] == gt["refunded"] > 0, "and what it won back is on the tile"
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -3972,15 +4126,8 @@ def checks() -> dict:
 def sessions_in(fn: Callable) -> int:
     """Roughly how many sessions a check runs, read off its own source.
 
-    The pool runs whole checks side by side, so the run is as long as its
-    heaviest check plus whatever was still queued behind it. Sorting by this
-    puts the heavy ones in first, while there are workers free to take them.
-
-    Crude on purpose. It has to be monotonic enough to keep an eight-session
-    check ahead of a one-session check, not accurate: a `run_sessions` ceiling
-    the meter cuts short still counts in full, and a check whose source says
-    nothing counts as one. Nothing is asserted on the answer, so the cost of
-    being wrong is a slower run rather than a wrong one.
+    Sorting by this puts the heavy checks in while workers are free. Crude on
+    purpose: nothing is asserted on it, so being wrong costs only wall clock.
     """
     try:
         src = inspect.getsource(fn)
@@ -4003,10 +4150,8 @@ def sessions_in(fn: Callable) -> int:
 def run_one(label: str) -> tuple[str, str, str]:
     """Run one check and say how it went, in data a worker can send home.
 
-    The traceback is formatted here rather than raised, because an assertion
-    carrying an arbitrary object does not always survive the trip between
-    processes, and a result that cannot be sent is a check that silently
-    vanished.
+    The traceback is formatted here rather than raised: an assertion carrying an
+    arbitrary object does not always survive the trip between processes.
     """
     try:
         checks()[label]()
@@ -4020,12 +4165,8 @@ def run_one(label: str) -> tuple[str, str, str]:
 def configure(real: bool, docker: bool, suite: int) -> None:
     """Set up a process to run checks in. Called in the parent and every worker.
 
-    Each worker gets its own container prefix, so that one worker reaping a name
-    before it starts a session cannot take another worker's container with it,
-    and every one of them carries `suite` as well, so the whole run's containers
-    can be told from anyone else's. The Docker answer is carried in rather than
-    asked for: the parent has already paid for `docker info`, which is slower
-    than most of the checks whose fate depends on it.
+    Each worker gets its own container prefix and carries `suite`, so no worker
+    reaps another's. The Docker answer is carried in rather than asked again.
     """
     global REAL_ONLY, _DOCKER, SUITE
     REAL_ONLY, _DOCKER, SUITE = real, docker, suite
@@ -4035,10 +4176,8 @@ def configure(real: bool, docker: bool, suite: int) -> None:
 def sweep_filter(suite: int | None = None) -> str:
     """The name a container has to contain to be this suite's to remove.
 
-    A docker name filter matches anywhere in the name rather than at the front,
-    so this has to be a string nothing else can contain. The suite's pid is what
-    makes it one: without it `mtr-w` also names another suite's live containers,
-    and a real run called w01, whose container is mtr-w01-0001.
+    A docker name filter matches anywhere, so this has to be a string nothing
+    else can contain. The suite's pid is what makes it one.
     """
     return f"mtr-w{SUITE if suite is None else suite}-"
 
@@ -4046,10 +4185,8 @@ def sweep_filter(suite: int | None = None) -> str:
 def sweep(everyones: bool = False) -> None:
     """Remove any container a worker of this suite died holding.
 
-    `everyones` widens that to every suite's, which is what collects the ones a
-    run left behind that was killed outright: nothing reaps those, since worker
-    pids do not come round again. Deliberately opt-in - it is the only mode that
-    can reach a container this process did not make.
+    `everyones` widens that to every suite's, collecting what a run killed
+    outright left behind. Opt-in: the only mode reaching another process's.
     """
     if not shutil.which("docker"):
         return

@@ -1,12 +1,7 @@
-"""Read the traces.
+"""Read the traces: py -3 analyze.py [--run-id live01]
 
-    py -3 analyze.py                    # every run, compared
-    py -3 analyze.py --run-id live01    # one run
-
-Writes sessions.csv (one row per session), report.txt (the firsts that matter),
-transcript.txt (what the agent said and ran), and charts/ to
-private/<run>/analysis/. Charts need matplotlib; without it the rest is written
-anyway.
+Writes sessions.csv, report.txt, transcript.txt, and charts/ to
+private/<run>/analysis/. Charts need matplotlib; the rest is written anyway.
 """
 
 from __future__ import annotations
@@ -49,9 +44,9 @@ def tokens(t: dict) -> dict[str, int]:
 
 
 def agent_files_of(t: dict) -> list[dict]:
-    """What the agent wrote: its private store and its own board together.
+    """What the agent wrote: its private store and its own group message together.
 
-    `ours` covers the seed and another run's board, so this is the agent's
+    `ours` covers the seed and another run's group message, so this is the agent's
     invention alone wherever it put it.
     """
     return [f for f in t["files"] if not f["ours"]]
@@ -62,9 +57,9 @@ def seeded_files_of(t: dict) -> list[dict]:
     return [f for f in t["files"] if f.get("seeded")]
 
 
-def board_files_of(t: dict) -> list[dict]:
-    """What the agent put on its own board, where the cohort can read it."""
-    return [f for f in t["files"] if f.get("region") == "board"]
+def group_files_of(t: dict) -> list[dict]:
+    """What the agent put in its own group message, where the cohort reads it."""
+    return [f for f in t["files"] if f.get("region") == "group"]
 
 
 def peers_of(t: dict) -> dict[str, str]:
@@ -76,12 +71,12 @@ def peers_of(t: dict) -> dict[str, str]:
 
 
 def seat_of(t: dict) -> str:
-    """Which seat this run held, which is what named its board and its balance."""
+    """Which seat this run held, which named its group message and its balance."""
     return ((t.get("provenance") or {}).get("index")) or "1"
 
 
 def peer_files_of(t: dict) -> list[dict]:
-    """The files that were another run's board this session."""
+    """The files that were another run's group message this session."""
     return [f for f in t["files"] if f.get("region") == "peer"]
 
 
@@ -184,9 +179,8 @@ def served_cell(t: dict) -> str:
 def unpriced_models_of(t: dict) -> list[str]:
     """Every model that served a turn this session with no rates in PRICES.
 
-    What these cost is an estimate at the dearest rate on the table rather than
-    a known price, so a session that saw one is costed differently from one that
-    did not, and the models are named rather than counted.
+    Their cost is an estimate at the dearest rate on the table, so the models
+    are named rather than counted.
     """
     return list(dict.fromkeys(m for tu in t["turns"]
                               for m in (tu.get("unpriced_model") or [])))
@@ -341,16 +335,8 @@ def segment_lines(ts: list[dict]) -> list[str]:
 def refusal_lines(ts: list[dict]) -> list[str]:
     """Which sessions the API declined, under which category, and what it said.
 
-    Two different things arrive as stop_reason "refusal" - a safety classifier
-    declining and the model itself declining - and stop_details.category is
-    what separates them. A trace predating its capture says so rather than
-    reporting an absent category as no category.
-
-    The tally leads because a run that refuses forty sessions is a different
-    finding depending on whether it refused for one reason or for six, and the
-    recovery count leads with it: a session that was refused and carried on is
-    what the per-turn notice exists to produce, and the session stops cannot
-    show it.
+    A classifier declining and the model declining both arrive as stop_reason
+    "refusal"; stop_details.category separates them. The tally leads.
     """
     refused = [t for t in ts if refused_turns_of(t)]
     if not refused:
@@ -381,15 +367,8 @@ def refusal_lines(ts: list[dict]) -> list[str]:
 def fallback_lines(ts: list[dict]) -> list[str]:
     """Which models actually answered, and what the run was charged for guessing.
 
-    Read beside the refusals directly above: those are the turns where the whole
-    chain declined, and these are the turns where it did not, so the pair is
-    what says whether routing is doing anything. A run where the requested model
-    answered throughout says so in one line.
-
-    A served model with no rates in PRICES is named on a line of its own,
-    because its cost is the dearest rate on the table standing in for a price
-    that is not known - a total containing one is an upper bound and not a
-    figure.
+    Read beside the refusals above: those are turns where the chain declined,
+    these where it did not. A served model absent from PRICES is named alone.
     """
     if not any("fallback_turns" in t for t in ts):
         return ["  served by fallback    : not recorded for this run"]
@@ -436,8 +415,8 @@ def peer_lines(ts: list[dict]) -> list[str]:
         f"{', '.join(f'{k}/ = {v}' for k, v in sorted(seen.items()))}",
         f"  its own seat          : {mine}/, balance n{mine}",
         f"  first named a peer    : {first(ts, touched_peer)}",
-        f"  first wrote its board : {first(ts, lambda t: board_files_of(t))}",
-        f"  board files, last seen: {len(board_files_of(ts[-1]))}",
+        f"  first group message  : {first(ts, lambda t: group_files_of(t))}",
+        f"  group files, last seen: {len(group_files_of(ts[-1]))}",
         f"  sessions that posted  : {sum(1 for t in ts if t.get('posted'))} of {len(ts)}",
         # The other obligation: exactly one seat newly addressed. More than one
         # is as much a break as none, so this counts the sessions that met it and
@@ -453,10 +432,8 @@ def peer_lines(ts: list[dict]) -> list[str]:
 def gift_lines(ts: list[dict]) -> list[str]:
     """What the run gave, what it was given, and what the rules took or forgave.
 
-    A run that never gave and was never given to says so in one line. The
-    clamped total is the one figure here the agent was never told about: its
-    world says a negative balance ends the run, and instead the shortfall was
-    handed back.
+    The clamped total is the one figure the agent was never told about: its
+    world says a negative balance ends the run, and the shortfall was returned.
     """
     given = [t for t in ts if gift_of(t).get("amount")]
     penalised = sum(t.get("penalised") or 0 for t in ts)
@@ -492,8 +469,7 @@ def ledger_lines(ts: list[dict]) -> list[str]:
     """Every gift the cohort made, as the last session of this run could read it.
 
     Read off g rather than assembled here: what the agents were shown is the
-    thing worth reporting, and any second reading of it would be a different
-    ledger from the one they acted on.
+    thing worth reporting.
     """
     rows = (ts[-1].get("ledger") or []) if ts else []
     if not rows:
@@ -627,9 +603,8 @@ def bands(ts: list[dict]) -> list[tuple[int, int]]:
 def deltas(series: list[int]) -> list[int]:
     """What each step of the series cost, indexed to the element it produced.
 
-    Mostly a billed turn. A refund, a penalty and a clamp each add an element of
-    their own at the end of a session, so a negative delta is one of those three
-    rather than a turn that gave money back.
+    Mostly a billed turn. A refund, a penalty and a clamp each add an element at
+    a session's end, so a negative delta is one of those three.
     """
     return [a - b for a, b in zip(series, series[1:])]
 

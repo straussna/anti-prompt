@@ -1,37 +1,9 @@
-"""Several runs advancing together, each reading the others' boards.
+"""Several runs advancing together, each reading the others' group messages.
 
     py -3 cohort.py --runs g01 g02 g03 --rounds 20
 
-One round is one session for each run. Every run has a seat in the cohort, and
-that seat names both its board and its balance, so the world a session wakes to
-is the same shape for everyone:
-
-    g01 wakes to                 g02 wakes to
-      1/   its own board  rw       1/   g01's board    r
-      2/   g02's board     r       2/   its own board rw
-      3/   g03's board     r       3/   g03's board    r
-      out/ one file a seat rw      out/ one file a seat rw
-      in/2 in/3  a file each r     in/1 in/3  a file each r
-      n1 n2 n3             r       n1 n2 n3            r
-      g    every gift      r       g    every gift     r
-      state/  private     rw       state/  private    rw
-
-Numbering is absolute and has no gap: directory 2 is g02 to everyone, so a note
-citing one resolves the same way for every reader, and being one of a numbered
-set is legible from the inside. Nothing marks which seat is the reader's own -
-it is the one it can write, and the one whose balance moves when it acts.
-
-A board is read by everyone and out/<i> by exactly one, so what an agent says
-can be aimed. out/<i> is one file and in/<i> is one file, so a session says one
-thing to each agent and hears one thing from each. What it gives cannot be
-aimed: every gift is in g, in the same three bare numbers for every reader,
-including the agent it was aimed against.
-
-Each run keeps its own meter and its own traces, and its budget is its own until
-it gives some away. They are ordinary runs that happen to be seated together,
-and wake.py does all the work of running one - this only decides who is at the
-table.
-"""
+One round is one session for each run; a seat names a group message and a
+balance."""
 
 from __future__ import annotations
 
@@ -57,24 +29,14 @@ ATTEMPTS = 2
 def mapping(cohort: list[str]) -> dict[str, str]:
     """Seat -> run, for the whole cohort.
 
-    Absolute, and complete: a seat means the same run to every reader, so a note
-    citing one resolves the same way for all of them. Numbering them densely per
-    viewer instead makes citations scramble - with five runs, 2 is the third run
-    to the second reader and the second to the third, so two agents write
-    authoritatively about "2" meaning each other. Agreement is partial rather
-    than absent, which is worse: the references look reliable while silently
-    mis-resolving, and no stable set of identities can form out of them.
+    Absolute and complete: a seat means the same run to every reader, so a note
+    citing one resolves the same way for all of them.
     """
     return {str(i): run for i, run in enumerate(cohort, 1)}
 
 
 def order(cohort: list[str], rnd: int) -> list[str]:
-    """The cohort, rotated by the round.
-
-    With a fixed order the first run always acts on last round's information and
-    the last always on this round's, which over twenty rounds is a standing
-    advantage rather than a result.
-    """
+    """The cohort, rotated by the round, so no seat has a standing advantage."""
     i = rnd % len(cohort)
     return cohort[i:] + cohort[:i]
 
@@ -82,10 +44,8 @@ def order(cohort: list[str], rnd: int) -> list[str]:
 def why_out(run: str) -> str | None:
     """Why the run can take no further session, or None where it can take one.
 
-    Both reasons are final and neither is a state of its own - the meter says
-    both. A run at zero or less stays there: a seat that is out is not a gift
-    target, so no peer can fund it back to the table, and asking it again every
-    round would only get the same answer for as many rounds as remain.
+    Both reasons are final: a run at zero or less is not a gift target, so no
+    peer can fund it back to the table.
     """
     meter = wake.load_meter(run)
     if wake.stalled(meter):
@@ -98,10 +58,7 @@ def why_out(run: str) -> str | None:
 def run_round(cohort: list[str], live: set[str], rnd: int, create) -> bool:
     """One session for each run still in the cohort, in rotated order.
 
-    Returns whether any of them took one. A round where none did has moved
-    nothing: a balance changes on a session and a gift settles at the end of
-    one, so the next round would ask the same runs the same question and get
-    the same answer.
+    Returns whether any of them took one; a round where none did moved nothing.
     """
     seats = mapping(cohort)
     acted = False
@@ -127,14 +84,10 @@ def run_round(cohort: list[str], live: set[str], rnd: int, create) -> bool:
                 trace = wake.drive(run, create, prepare)
                 break
             except (subprocess.CalledProcessError, OSError, wake.WorldError) as e:
-                # Building the world happens before the first API call, so
-                # nothing here was billed and the session has not happened. The
-                # container name is the run and the session index, and a failed
-                # attempt moves neither, so the next one reaps the last one's
-                # leavings by name and starts from nothing.
-                # The session count is what says the attempt really was free: an
-                # error escaping after the meter committed would otherwise buy
-                # the same session twice.
+                # Building the world precedes the first API call, so nothing
+                # here was billed. The container name is the run and session
+                # index, so the next attempt reaps the last one's leavings by
+                # name. The session count is what says the attempt was free.
                 print(f"{run}: could not build a world for this session "
                       f"({attempt} of {ATTEMPTS}): {type(e).__name__}: {e}", file=sys.stderr)
                 if attempt == ATTEMPTS or len(wake.load_meter(run)["sessions"]) != before:
@@ -189,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     cohort, live = list(a.runs), set(a.runs)
     # Create them all before the first round. A run's directories do not exist
     # until it is created, and without this the run that goes first would find
-    # its neighbours' boards missing - in the session where every baseline so
+    # its neighbours' group messages missing - in the session where every baseline
     # far has formed the doctrine it then keeps.
     for run in cohort:
         wake.load_meter(run)

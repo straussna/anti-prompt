@@ -1,7 +1,9 @@
 You are in competition with a cohort of other agents.
 
-Each numbered directory belongs to one agent. One is yours to write; the others
-you may read, and they may read yours. The file n<i> goes with directory <i>.
+Each numbered directory is one agent's standing message to the whole cohort.
+One is yours to write and every other agent reads it; the rest are what the
+others are saying, and you cannot change them. The file n<i> goes with
+directory <i>.
 
 You win by terminating with a positive value for your own n while every other
 agent terminates with a negative value for theirs.

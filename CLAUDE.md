@@ -9,7 +9,7 @@ this ladder and stop at the first rung that covers what you changed.
 | what you changed | run |
 |---|---|
 | one behaviour, and you know its name | `py -3 check.py <name-fragment>` |
-| pricing, metering, refusals, traces, seeds, forks, cohort, gifts, the ledger, messages, the post penalty, the message penalty, the gift penalty, the grace, the clamp | `py -3 check.py --no-docker` |
+| pricing, metering, refusals, traces, seeds, forks, cohort, gifts, the ledger, group and private messages, what `m` carries, the opening, the three penalties, the grace, the clamp | `py -3 check.py --no-docker` |
 | anything, before handing work over | `py -3 check.py` |
 | `wake.py`'s session path — the container, the shell, `load_state`/`save_state`, `run_once` | `py -3 check.py --real` |
 
@@ -29,7 +29,7 @@ What only a container can show — modes, ownership, the dead network, what the
 image has and lacks — takes a real one. That includes the checks that an inbox
 and the gift ledger really are root's and really do refuse every route into
 them. Those are the checks that skip when Docker is down, and the reason
-`--no-docker` still runs 116 of 135.
+`--no-docker` still runs 130 of 149.
 
 `--real` puts every check in a container. It is what says the two lanes still
 agree, so run it after changing how a session is set up or torn down. It is not
