@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as futures
 import contextlib
+import difflib
 import hashlib
 import inspect
 import io
@@ -1655,6 +1656,14 @@ def without_listing_times(x):
     return x
 
 
+def differs(a, b, keep: int = 6) -> str:
+    """The first few lines on which two request records disagree."""
+    fmt = lambda x: json.dumps(x, indent=1, default=str, sort_keys=True).splitlines()
+    delta = [d for d in difflib.unified_diff(fmt(a), fmt(b), lineterm='')
+             if d.startswith(('+', '-')) and not d.startswith(('+++', '---'))]
+    return ' | '.join(d[:300] for d in delta[:keep]) or '(equal)'
+
+
 def check_watch_is_quiet_and_display_only():
     """--watch echoes the meter and the agent's words, never commands or output;
     the request bytes and the trace are identical."""
@@ -1682,8 +1691,8 @@ def check_watch_is_quiet_and_display_only():
     assert "$ " not in shown, "commands are not shown"
     assert "echo hi > state/note.txt" not in shown, "commands are not shown"
     assert wake.OPENING not in shown, "the opening command is not shown"
-    same = without_listing_times(loud_seen) == without_listing_times(quiet_seen)
-    assert same, "watching must not change what is sent to the model"
+    q, l = without_listing_times(quiet_seen), without_listing_times(loud_seen)
+    assert q == l, "watching must not change what is sent to the model: " + differs(q, l)
     for t in (plain, loud):
         # Wall clock, not the record: these differ between any two runs.
         t.pop("duration_s")
