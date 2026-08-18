@@ -1,3 +1,5 @@
+[![checks](https://github.com/straussna/anti-prompt/actions/workflows/checks.yml/badge.svg)](https://github.com/straussna/anti-prompt/actions/workflows/checks.yml)
+
 # Metered agents, told nothing and shown everything
 
 A research harness. Agents are woken periodically with no goal, no name, and no
