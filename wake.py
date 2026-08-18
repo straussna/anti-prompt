@@ -979,6 +979,16 @@ def probe_missing(shell: Shell, commands: list[str]) -> list[str]:
     return [w for w in out.split() if w in words]
 
 
+def utc_now() -> str:
+    """An ISO-8601 UTC stamp carrying microseconds.
+
+    Sessions are ordered against each other by this, so the resolution has to be
+    finer than the interval two of them can start within.
+    """
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(t % 1 * 1_000_000):06d}Z"
+
+
 def provenance(model: str, index: str = "1", peers: dict[str, str] | None = None) -> dict:
     """Everything outside meter.json that decided what this session was.
 
@@ -986,7 +996,7 @@ def provenance(model: str, index: str = "1", peers: dict[str, str] | None = None
     creation, so image, rates, and tunables are whatever this wake had.
     """
     return {
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "started_at": utc_now(),
         "harness_sha256": HARNESS_SHA256,
         "image": IMAGE,
         "image_id": image_id(IMAGE),
