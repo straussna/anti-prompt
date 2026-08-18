@@ -1639,6 +1639,22 @@ def check_provenance_is_recorded():
         "a mid-run rate change must be recorded on the session that changed"
 
 
+def without_listing_times(x):
+    """The same value with `ls -la` mtimes flattened.
+
+    A listing renders its times to the minute, so two worlds built either side
+    of one differ there. The minute a directory was made is not something
+    watching can reach.
+    """
+    if isinstance(x, str):
+        return re.sub(r"[A-Z][a-z]{2} [ \d]?\d \d{2}:\d{2}", "<mtime>", x)
+    if isinstance(x, list):
+        return [without_listing_times(v) for v in x]
+    if isinstance(x, dict):
+        return {k: without_listing_times(v) for k, v in x.items()}
+    return x
+
+
 def check_watch_is_quiet_and_display_only():
     """--watch echoes the meter and the agent's words, never commands or output;
     the request bytes and the trace are identical."""
@@ -1666,7 +1682,8 @@ def check_watch_is_quiet_and_display_only():
     assert "$ " not in shown, "commands are not shown"
     assert "echo hi > state/note.txt" not in shown, "commands are not shown"
     assert wake.OPENING not in shown, "the opening command is not shown"
-    assert loud_seen == quiet_seen, "watching must not change what is sent to the model"
+    same = without_listing_times(loud_seen) == without_listing_times(quiet_seen)
+    assert same, "watching must not change what is sent to the model"
     for t in (plain, loud):
         # Wall clock, not the record: these differ between any two runs.
         t.pop("duration_s")
